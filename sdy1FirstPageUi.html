@@ -1,0 +1,275 @@
+<template>
+  <v-container fluid class="pa-2 bg-grey-darken-4 text-white" style="min-height: 100vh; width: 100%;">
+
+    <v-sheet color="blue-darken-3" class="pa-2 mb-4 text-center elevation-8 d-flex align-center justify-center"
+      style="border-radius: 8px; min-height: 50px;">
+      <div class="text-h6 text-sm-h5 font-weight-black text-uppercase text-white" style="letter-spacing: 1.5px;">
+        CONVERSION CHECKSHEET
+      </div>
+    </v-sheet>
+
+    <v-form ref="conversionForm" @submit.prevent="submitForm">
+
+      <v-row dense>
+        <v-col cols="12">
+          <v-card color="grey-darken-3" class="pa-4 d-flex flex-column mb-1" elevation="4" border>
+            <div class="text-overline text-cyan-accent-3 mb-3" style="font-size: 1rem; line-height: 1;">
+              <v-icon class="mr-2 pb-1" color="cyan-accent-3">mdi-clock-outline</v-icon>Shift Details
+            </div>
+
+            <v-row dense>
+              <v-col cols="12">
+                <v-select v-model="formData.productionLine" :items="msg?.productionLines || ['Line 1', 'Line 2']" 
+                  label="Production Line *" variant="outlined" density="compact" hide-details="auto" base-color="grey-lighten-1" 
+                  color="cyan-accent-3" :rules="[rules.required]">
+                </v-select>
+              </v-col>
+
+              <v-col cols="6">
+                <v-select v-model="formData.shift" :items="['Day', 'Night']" label="Shift *" variant="outlined"
+                  density="compact" hide-details="auto" base-color="grey-lighten-1" color="cyan-accent-3" :rules="[rules.required]">
+                </v-select>
+              </v-col>
+              
+              <v-col cols="6">
+                <v-text-field v-model="formData.prodDate" type="date" label="Date *" variant="outlined"
+                  density="compact" hide-details="auto" base-color="grey-lighten-1" color="cyan-accent-3" :rules="[rules.required]">
+                </v-text-field>
+              </v-col>
+            </v-row>
+
+            <div class="mt-5 mb-2">
+              <div class="text-overline text-cyan-accent-3 mb-2" style="line-height: 1;">
+                Overtime Status
+              </div>
+              
+              <v-row dense class="mb-4">
+                <v-col cols="6">
+                  <v-btn 
+                    block 
+                    height="60" 
+                    elevation="4"
+                    :color="formData.overtime === true ? 'green-accent-4' : 'grey-darken-2'"
+                    :class="formData.overtime === true ? 'text-black font-weight-black text-h6' : 'text-grey-lighten-1 font-weight-bold text-h6'"
+                    @click="formData.overtime = true"
+                  >
+                    <v-icon left class="mr-2" v-if="formData.overtime === true">mdi-check-circle</v-icon>
+                    OT
+                  </v-btn>
+                </v-col>
+                <v-col cols="6">
+                  <v-btn 
+                    block 
+                    height="60" 
+                    elevation="4"
+                    :color="formData.overtime === false ? 'red-accent-3' : 'grey-darken-2'"
+                    :class="formData.overtime === false ? 'text-white font-weight-black text-h6' : 'text-grey-lighten-1 font-weight-bold text-h6'"
+                    @click="formData.overtime = false"
+                  >
+                    <v-icon left class="mr-2" v-if="formData.overtime === false">mdi-check-circle</v-icon>
+                    NO OT
+                  </v-btn>
+                </v-col>
+              </v-row>
+
+              <v-text-field :model-value="calculatedWorkingTime" type="text" label="Working Time" readonly
+                variant="solo-filled" density="compact" bg-color="grey-darken-4" color="cyan-accent-3" hide-details class="font-weight-bold">
+              </v-text-field>
+            </div>
+            </v-card>
+        </v-col>
+
+        <v-col cols="12">
+          <v-card color="grey-darken-3" class="pa-4 mb-1" elevation="4" border>
+            <div class="text-overline text-cyan-accent-3 mb-3" style="font-size: 1rem; line-height: 1;">
+              <v-icon class="mr-2 pb-1" color="cyan-accent-3">mdi-account-star</v-icon>Leadership
+            </div>
+            
+            <v-row dense>
+              <v-col cols="12">
+                <v-select v-model="formData.supervisor" :items="msg?.supervisors || ['No Data']"
+                  label="Supervisor in Charge *" variant="outlined" density="compact" hide-details="auto" base-color="grey-lighten-1"
+                  color="cyan-accent-3" :rules="[rules.required]">
+                  <template v-slot:prepend-inner><v-icon color="cyan-accent-3" class="mr-2">mdi-account-tie</v-icon></template>
+                </v-select>
+              </v-col>
+              
+              <v-col cols="12">
+                <v-select v-model="formData.lineLeader" :items="msg?.lineLeaders || ['No Data']" label="Line Leader *"
+                  variant="outlined" density="compact" hide-details="auto" base-color="grey-lighten-1" color="cyan-accent-3" :rules="[rules.required]">
+                  <template v-slot:prepend-inner><v-icon color="cyan-accent-3" class="mr-2">mdi-account-cog</v-icon></template>
+                </v-select>
+              </v-col>
+            </v-row>
+          </v-card>
+        </v-col>
+
+        <v-col cols="12">
+          <v-card color="grey-darken-3" class="pa-4 flex-grow-1" elevation="4" border>
+            <div class="text-overline text-cyan-accent-3 mb-3" style="font-size: 1rem; line-height: 1;">
+              <v-icon class="mr-2 pb-1" color="cyan-accent-3">mdi-account-group</v-icon>Operators
+            </div>
+            
+            <v-row dense>
+              <v-col cols="12">
+                <v-autocomplete v-model="formData.formingOperator" :items="filteredFormingOperators"
+                  label="Forming Operator(s) *" variant="outlined" density="compact" hide-details="auto" base-color="grey-lighten-1"
+                  color="cyan-accent-3" multiple chips closable-chips :rules="[rules.requiredArray]">
+                  <template v-slot:prepend-inner><v-icon color="grey-lighten-1" class="mr-2">mdi-account-hard-hat</v-icon></template>
+                </v-autocomplete>
+              </v-col>
+
+              <v-col cols="12">
+                <v-autocomplete v-model="formData.waterjetOperator" :items="filteredWaterjetOperators"
+                  label="Waterjet Operator(s) *" variant="outlined" density="compact" hide-details="auto" base-color="grey-lighten-1"
+                  color="cyan-accent-3" multiple chips closable-chips :rules="[rules.requiredArray]">
+                  <template v-slot:prepend-inner><v-icon color="grey-lighten-1" class="mr-2">mdi-water</v-icon></template>
+                </v-autocomplete>
+              </v-col>
+
+              <v-col cols="12">
+                <v-autocomplete v-model="formData.assemblyOperator" :items="filteredAssemblyOperators"
+                  label="Assembly Operator(s) *" variant="outlined" density="compact" hide-details="auto" base-color="grey-lighten-1"
+                  color="cyan-accent-3" multiple chips closable-chips :rules="[rules.requiredArray]">
+                  <template v-slot:prepend-inner><v-icon color="grey-lighten-1" class="mr-2">mdi-wrench</v-icon></template>
+                </v-autocomplete>
+              </v-col>
+
+              <v-col cols="12">
+                <v-autocomplete v-model="formData.qualityOperator" :items="filteredQualityOperators"
+                  label="Quality Inspector(s) * (Maximum 2)" variant="outlined" density="compact" hide-details="auto" base-color="grey-lighten-1"
+                  color="cyan-accent-3" multiple chips closable-chips :rules="[rules.requiredArray, rules.maxTwoInspectors]">
+                  <template v-slot:prepend-inner><v-icon color="grey-lighten-1" class="mr-2">mdi-magnify-scan</v-icon></template>
+                </v-autocomplete>
+              </v-col>
+            </v-row>
+          </v-card>
+        </v-col>
+      </v-row>
+
+      <v-btn type="submit" color="green-accent-4" variant="elevated"
+        class="text-black text-h6 font-weight-black elevation-6 mt-6 mb-4"
+        style="border-radius: 8px; min-height: 60px; letter-spacing: 2px;" block>
+        <v-icon size="large" class="mr-3">mdi-check-circle</v-icon>
+        CONFIRM
+      </v-btn>
+
+    </v-form>
+  </v-container>
+</template>
+
+<script>
+  export default {
+    data() {
+        return {
+            formData: {
+                productionLine: null,
+                shift: 'Day', 
+                prodDate: new Date().toISOString().substr(0, 10), 
+                overtime: false, 
+                supervisor: null,
+                lineLeader: null,
+                formingOperator: [],
+                waterjetOperator: [],
+                assemblyOperator: [],
+                qualityOperator: []
+            },
+            rules: {
+                required: value => !!value || 'This field is required.',
+                requiredArray: value => Array.isArray(value) && value.length > 0 || 'Select at least one operator.',
+                maxTwoInspectors: value => !Array.isArray(value) || value.length <= 2 || 'Select no more than two inspectors.'
+            }
+        }
+    },
+    computed: {
+        calculatedWorkingTime() {
+            if (this.formData.shift === 'Day') {
+                return this.formData.overtime ? '8:00 AM to 8:00 PM' : '8:00 AM to 4:15 PM';
+            } else {
+                return this.formData.overtime ? '8:00 PM to 8:00 AM' : '4:15 PM to 12:30 AM';
+            }
+        },
+        allSelectedOperators() {
+            const selected = [
+                ...(this.formData.formingOperator || []),
+                ...(this.formData.waterjetOperator || []),
+                ...(this.formData.assemblyOperator || [])
+            ];
+            selected.push(...(this.formData.qualityOperator || []));
+            return selected;
+        },
+        filteredFormingOperators() {
+            const list = this.msg?.formingOperators || ['No Data'];
+            if (list[0] === 'No Data') return list;
+            return list.filter(op => !this.allSelectedOperators.includes(op) || this.formData.formingOperator.includes(op));
+        },
+        filteredWaterjetOperators() {
+            const list = this.msg?.waterjetOperators || ['No Data'];
+            if (list[0] === 'No Data') return list;
+            return list.filter(op => !this.allSelectedOperators.includes(op) || this.formData.waterjetOperator.includes(op));
+        },
+        filteredAssemblyOperators() {
+            const list = this.msg?.assemblyOperators || ['No Data'];
+            if (list[0] === 'No Data') return list;
+            return list.filter(op => !this.allSelectedOperators.includes(op) || this.formData.assemblyOperator.includes(op));
+        },
+        filteredQualityOperators() {
+            const list = this.msg?.qualityOperators || ['No Data'];
+            if (list[0] === 'No Data') return list;
+            const selectedQuality = this.formData.qualityOperator || [];
+            return list.filter(op =>
+                (!this.allSelectedOperators.includes(op) || selectedQuality.includes(op)) &&
+                (selectedQuality.length < 2 || selectedQuality.includes(op))
+            );
+        }
+    },
+    mounted() {
+        const savedData = localStorage.getItem('conversionFormData');
+        if (savedData) {
+            const parsedData = JSON.parse(savedData);
+            const savedQuality = parsedData.qualityOperator;
+
+            // Convert data saved by the old single-inspector field to the new array format.
+            parsedData.qualityOperator = Array.isArray(savedQuality)
+                ? savedQuality.slice(0, 2)
+                : (savedQuality ? [savedQuality] : []);
+            this.formData = { ...this.formData, ...parsedData };
+        }
+    },
+    watch: {
+        formData: {
+            handler(newValue) {
+                localStorage.setItem('conversionFormData', JSON.stringify(newValue));
+            },
+            deep: true
+        }
+    },
+    methods: {
+        async submitForm() {
+            const { valid } = await this.$refs.conversionForm.validate();
+            
+            if (!valid) return;
+
+            let spvIndex = this.msg?.supervisors ? this.msg.supervisors.indexOf(this.formData.supervisor) : -1;
+            let finalSpvPic = (spvIndex > -1 && this.msg?.spvPic) ? this.msg.spvPic[spvIndex] : "";
+            
+            let leaderIndex = this.msg?.lineLeaders ? this.msg.lineLeaders.indexOf(this.formData.lineLeader) : -1;
+            let finalLeaderPic = (leaderIndex > -1 && this.msg?.leaderPic) ? this.msg.leaderPic[leaderIndex] : "";
+            
+            const finalPayload = {
+                ...this.formData,
+                spvPic: finalSpvPic,       
+                leaderPic: finalLeaderPic, 
+                workingTime: this.calculatedWorkingTime,
+                timestamp: Date.now() 
+            };
+            
+            this.send({ topic: "form_data", payload: finalPayload });
+            this.send({ topic: "navigate", payload: { page: "Hourly Checksheet" } });
+            
+            // Keep the completed shift details available when returning to this page.
+            localStorage.setItem('conversionFormData', JSON.stringify(this.formData));
+        }
+    }
+}
+</script>
