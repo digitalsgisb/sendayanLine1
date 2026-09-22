@@ -58,6 +58,30 @@ sudo systemctl enable --now "sdy1@$USER.service"
 
 See `SQLITE_RECOVERY_GUIDE.md` for restart, buffer, and outbox behavior.
 
+## Pull future updates on the Raspberry Pi
+
+Check for local edits before pulling. If `git status --short` prints unexpected
+files, stop and review them first. Do not discard Raspberry Pi changes or its
+runtime database.
+
+```bash
+cd "$HOME/sdy1"
+git status --short
+git pull --ff-only origin main
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
+sudo install -m 0644 deploy/sdy1@.service /etc/systemd/system/sdy1@.service
+sudo systemctl daemon-reload
+sudo systemctl restart "sdy1@$USER.service"
+sudo systemctl status "sdy1@$USER.service" --no-pager
+```
+
+If the service does not start, inspect its latest logs:
+
+```bash
+sudo journalctl -u "sdy1@$USER.service" -n 100 --no-pager
+```
+
 ## Google Apps Script deployment
 
 `appScriptSdy1.js` is the matching backend for the Line 1 spreadsheet. Copy it
@@ -67,3 +91,24 @@ Keep the deployed `/exec` URL equal to `WEB_APP_URL` in `sdy1.py`.
 The backend combines repeated records in the same hour, selects the latest
 same-shift details, validates allowed data tabs, and deduplicates Python HTTP
 retries by `request_id`. Run `node tests/test_sdy1_appscript.js` before deployment.
+
+### Duplicate-delivery protection
+
+- Each data tab receives a trailing `Request_ID` column automatically. Keep this
+  column in place: it is the durable idempotency record used after cache expiry,
+  network timeouts, and process restarts.
+- Hourly rows and shift PDFs use deterministic request IDs, so the same logical
+  event is rejected even if it is queued twice or sent by a restarted client.
+  MQTT reject, downtime, shift, and parameter events reuse their supplied
+  `event_id` when one is available.
+- Exact legacy duplicate rows are ignored when the PDF aggregates hourly,
+  rejection, and downtime totals.
+- `GENERATE_PDF` reuses the latest existing PDF for the same shift. Send
+  `"force_regenerate": true` with a new `request_id` only when an intentional
+  replacement report is required after correcting source data.
+- The Python sender allows up to 120 seconds for PDF export and retries failures
+  with exponential backoff while preserving the original `request_id`.
+
+After changing `appScriptSdy1.js`, create a new Apps Script web-app deployment
+version; saving the editor is not enough. Confirm the deployed `/exec` URL still
+matches `WEB_APP_URL`, then update and restart the Raspberry Pi service.

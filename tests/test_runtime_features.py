@@ -1,7 +1,9 @@
 import ast
 from datetime import datetime, timedelta
+import json
 import os
 import unittest
+import uuid
 
 
 SCRIPT_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "sdy1.py")
@@ -59,6 +61,25 @@ class RuntimeFeatureTests(unittest.TestCase):
         self.assertIn('request_id = item.setdefault("request_id", str(uuid.uuid4()))', source)
         self.assertLess(source.index("restore_runtime_state()"), source.index("mqtt_client = mqtt.Client()"))
 
+    def test_google_request_id_is_deterministic_for_logical_retries(self):
+        source = read_source()
+        tree = ast.parse(source, filename=SCRIPT_PATH)
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "build_google_request_id"
+        )
+        namespace = {"json": json, "uuid": uuid, "LINE_CODE": "SDY1"}
+        exec(compile(ast.Module(body=[function], type_ignores=[]), SCRIPT_PATH, "exec"), namespace)
+
+        row = ["SHIFT-1", "2026-08-03", "M1", "1.00-2.00", 17, 19, "LOT", 0]
+        first = namespace["build_google_request_id"]("Hourly_Data", row)
+        second = namespace["build_google_request_id"]("Hourly_Data", list(row))
+        self.assertEqual(first, second)
+        self.assertNotEqual(
+            first,
+            namespace["build_google_request_id"]("Hourly_Data", row[:-1] + [1]),
+        )
+
     def test_entry_window_is_exactly_45_minutes(self):
         namespace, calls = load_window_functions()
         boundary = datetime.now()
@@ -104,6 +125,7 @@ class RuntimeFeatureTests(unittest.TestCase):
             "LINE_CODE": "SDY1",
             "datetime": datetime,
             "google_sheets_queue": LoggedQueue(),
+            "build_google_request_id": lambda *_args: "pdf-request-id",
             "push_hourly_to_sheets": lambda **_kwargs: actions.append("hourly"),
             "reset_shift_data": lambda **_kwargs: actions.append("reset"),
             "checkpoint_and_queue_event": lambda *_args, **_kwargs: actions.append("event"),
@@ -111,6 +133,64 @@ class RuntimeFeatureTests(unittest.TestCase):
         exec(compile(ast.Module(body=[function], type_ignores=[]), SCRIPT_PATH, "exec"), namespace)
         namespace["execute_end_shift"]("19.00-20.00", "TEST")
         self.assertEqual(actions, ["hourly", "reset", "event", "pdf"])
+
+    def test_google_pdf_retry_preserves_request_id_and_backs_off(self):
+        source = read_source()
+        tree = ast.parse(source, filename=SCRIPT_PATH)
+        function = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "process_gsheets_queue"
+        )
+
+        class Clock:
+            now = 100.0
+
+            @classmethod
+            def time(cls):
+                return cls.now
+
+        class FakeRequests:
+            calls = []
+
+            @classmethod
+            def post(cls, url, json, timeout):
+                cls.calls.append((url, dict(json), timeout))
+                raise RuntimeError("simulated timeout")
+
+        class FakeUuid:
+            @staticmethod
+            def uuid4():
+                return "stable-request-id"
+
+        queue = [{"action": "GENERATE_PDF", "shift_id": "TEST-SHIFT"}]
+        namespace = {
+            "google_sheets_queue": queue,
+            "time": Clock,
+            "uuid": FakeUuid,
+            "requests": FakeRequests,
+            "WEB_APP_URL": "https://example.invalid/exec",
+            "GOOGLE_APPEND_TIMEOUT_SECONDS": 30,
+            "GOOGLE_PDF_TIMEOUT_SECONDS": 120,
+            "GOOGLE_RETRY_BASE_SECONDS": 5,
+            "GOOGLE_RETRY_MAX_SECONDS": 300,
+        }
+        exec(compile(ast.Module(body=[function], type_ignores=[]), SCRIPT_PATH, "exec"), namespace)
+
+        namespace["process_gsheets_queue"]()
+        self.assertEqual(FakeRequests.calls[0][2], 120)
+        self.assertEqual(queue[0]["request_id"], "stable-request-id")
+        self.assertEqual(queue[0]["attempt_count"], 1)
+        self.assertEqual(queue[0]["next_retry_at"], 105.0)
+
+        Clock.now = 104.0
+        namespace["process_gsheets_queue"]()
+        self.assertEqual(len(FakeRequests.calls), 1, "retry must wait for its backoff")
+
+        Clock.now = 105.0
+        namespace["process_gsheets_queue"]()
+        self.assertEqual(FakeRequests.calls[1][1]["request_id"], "stable-request-id")
+        self.assertEqual(queue[0]["attempt_count"], 2)
+        self.assertEqual(queue[0]["next_retry_at"], 115.0)
 
 
 if __name__ == "__main__":

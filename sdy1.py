@@ -20,7 +20,7 @@ from sdy_shift_schedule import (
 # ==========================================
 PROX_SENSOR_1_PIN = 5   
 PROX_SENSOR_2_PIN = 27   
-LIMIT_SWITCH_PIN = 17   
+LIMIT_SWITCH_PIN = 26   
 
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(PROX_SENSOR_1_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
@@ -89,6 +89,10 @@ MQTT_TOPIC_LIVE_SNAPSHOT = "smartchecksheet/live"
 
 # Google Sheets Web App URL
 WEB_APP_URL = "https://script.google.com/macros/s/AKfycbxGLj9Ap-mrzAGMyFT3SpV4-lt1kXJqIB-UiAJ1bUfrWujup4GK0CGjbJ6DBf4rx3H7-w/exec"
+GOOGLE_APPEND_TIMEOUT_SECONDS = 30
+GOOGLE_PDF_TIMEOUT_SECONDS = 120
+GOOGLE_RETRY_BASE_SECONDS = 5
+GOOGLE_RETRY_MAX_SECONDS = 300
 
 SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 SQLITE_DATABASE_PATH = os.environ.get(
@@ -156,6 +160,32 @@ except Exception as exc:
 def safe_int(val):
     try: return int(val)
     except (ValueError, TypeError): return 0
+
+def build_google_request_id(scope, identity=None):
+    if identity is None:
+        return str(uuid.uuid4())
+    canonical_identity = json.dumps(
+        identity,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return str(
+        uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{LINE_CODE}:{scope}:{canonical_identity}",
+        )
+    )
+
+def queue_google_sheet_row(tab_name, row_data, event_id=None):
+    request_identity = event_id
+    if request_identity is None and tab_name == "Hourly_Data":
+        request_identity = row_data
+    google_sheets_queue.append({
+        "tab": tab_name,
+        "row": row_data,
+        "request_id": build_google_request_id(tab_name, request_identity),
+    })
 
 def get_hour_slot(dt=None):
     if dt is None:
@@ -546,7 +576,11 @@ def execute_end_shift(hour_slot_override=None, end_reason="MANUAL SHIFT END"):
     checkpoint_and_queue_event(
         "shift.ended", ending_event, shift_id=ending_shift_id
     )
-    google_sheets_queue.append({"action": "GENERATE_PDF", "shift_id": ending_shift_id})
+    google_sheets_queue.append({
+        "action": "GENERATE_PDF",
+        "shift_id": ending_shift_id,
+        "request_id": build_google_request_id("GENERATE_PDF", ending_shift_id),
+    })
     print(f"[GOOGLE QUEUE] PDF generation queued for Shift: {ending_shift_id}.")
 
 def push_hourly_to_sheets(
@@ -584,7 +618,7 @@ def push_hourly_to_sheets(
     print(f"\n[EVENT - HOURLY CALCULATION] Reason: {reason}")
     print(f" â””â”€â”€> QUEUING DATA: {row_data}")
     
-    google_sheets_queue.append({"tab": "Hourly_Data", "row": row_data})
+    queue_google_sheet_row("Hourly_Data", row_data)
 
     hourly_event = {
         "shift_id": current_shift["shift_id"],
@@ -717,7 +751,7 @@ def on_message(client, userdata, msg):
                 current_shift["forming"], current_shift["waterjet"],
                 current_shift["assembly"], current_shift["quality"],
             ]
-            google_sheets_queue.append({"tab": "Shift_Data", "row": row_data})
+            queue_google_sheet_row("Shift_Data", row_data, data.get("event_id"))
             checkpoint_and_queue_event(
                 "shift.updated" if previous_shift_id == new_shift_id else "shift.started",
                 {
@@ -762,7 +796,7 @@ def on_message(client, userdata, msg):
                 data.get("totalRejectNG", ""), data.get("ngRejectCode", ""), 
                 data.get("totalLoftLayerReject", ""), data.get("loftLayerRejectCode", "")
             ]
-            google_sheets_queue.append({"tab": "Reject_Data", "row": row_data})
+            queue_google_sheet_row("Reject_Data", row_data, data.get("event_id"))
             if current_shift["shift_id"] != "NO PROD":
                 checkpoint_and_queue_event(
                     "reject.recorded",
@@ -787,7 +821,7 @@ def on_message(client, userdata, msg):
                 data.get("category", ""), data.get("code", ""), 
                 data.get("durationMinutes", ""), data.get("description", ""), data.get("remarks", "")
             ]
-            google_sheets_queue.append({"tab": "Downtime_Data", "row": row_data})
+            queue_google_sheet_row("Downtime_Data", row_data, data.get("event_id"))
             if current_shift["shift_id"] != "NO PROD":
                 checkpoint_and_queue_event(
                     "downtime.recorded",
@@ -823,7 +857,7 @@ def on_message(client, userdata, msg):
                 temp_data.get("rh", ""), temp_data.get("ctr", ""), temp_data.get("lh", ""),
                 glue_data.get("std", ""), glue_data.get("act", "")
             ]
-            google_sheets_queue.append({"tab": "Parameter_Data", "row": row_data})
+            queue_google_sheet_row("Parameter_Data", row_data, data.get("event_id"))
             if current_shift["shift_id"] != "NO PROD":
                 checkpoint_and_queue_event(
                     "parameter.recorded",
@@ -918,6 +952,8 @@ if outbox_sender is not None:
 # ==========================================
 def process_gsheets_queue():
     if len(google_sheets_queue) > 0:
+        if time.time() < google_sheets_queue[0].get("next_retry_at", 0):
+            return
         item = google_sheets_queue.pop(0)
         request_id = item.setdefault("request_id", str(uuid.uuid4()))
         if item.get("action") == "GENERATE_PDF":
@@ -927,6 +963,7 @@ def process_gsheets_queue():
                 "request_id": request_id,
             }
             description = f"PDF generation for {item['shift_id']}"
+            request_timeout = GOOGLE_PDF_TIMEOUT_SECONDS
         else:
             payload = {
                 "action": "APPEND_ROW",
@@ -935,8 +972,13 @@ def process_gsheets_queue():
                 "request_id": request_id,
             }
             description = f"{item['tab']} data"
+            request_timeout = GOOGLE_APPEND_TIMEOUT_SECONDS
         try:
-            response = requests.post(WEB_APP_URL, json=payload, timeout=15)
+            response = requests.post(
+                WEB_APP_URL,
+                json=payload,
+                timeout=request_timeout,
+            )
             response.raise_for_status()
             try:
                 response_body = response.json()
@@ -948,7 +990,17 @@ def process_gsheets_queue():
                 raise RuntimeError(f"Apps Script rejected the request: {response_body}")
             print(f"[HTTP] SUCCESS! Completed Google action: {description}.")
         except Exception as e:
-            print(f"[HTTP ERROR] Failed to send; re-queuing {description}: {e}")
+            attempt_count = item.get("attempt_count", 0) + 1
+            retry_delay = min(
+                GOOGLE_RETRY_BASE_SECONDS * (2 ** min(attempt_count - 1, 6)),
+                GOOGLE_RETRY_MAX_SECONDS,
+            )
+            item["attempt_count"] = attempt_count
+            item["next_retry_at"] = time.time() + retry_delay
+            print(
+                f"[HTTP ERROR] Failed to send {description}; retrying in "
+                f"{retry_delay}s with request {request_id}: {e}"
+            )
             google_sheets_queue.insert(0, item)
 
 def publish_live_data():
