@@ -54,7 +54,7 @@ class RuntimeFeatureTests(unittest.TestCase):
     def test_shared_lifecycle_features_are_wired(self):
         source = read_source()
         self.assertIn("STATUS_WAITING_FOR_SHIFT = 7", source)
-        self.assertIn("production_day_key(datetime.now())", source)
+        self.assertIn("advance_shift_schedule(now)", source)
         self.assertIn("production_tracking_enabled = active_shift or buffering_shift_entry", source)
         self.assertIn("restore_runtime_state()", source)
         self.assertIn('"action": "GENERATE_PDF"', source)
@@ -119,6 +119,7 @@ class RuntimeFeatureTests(unittest.TestCase):
             "base_time_this_hour": 1.0,
             "lost_time_this_hour": 0.0,
             "hourly_rest_time": 0.0,
+            "downtime_session": {"status": "idle"},
             "shift_total_output": 3,
             "total_output": 3,
             "total_rejects": 0,

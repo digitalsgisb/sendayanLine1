@@ -4,13 +4,16 @@ import time
 from datetime import datetime, timedelta
 import json
 import os
+import threading
 import uuid
 import paho.mqtt.client as mqtt
 import requests
 
+from sdy_downtime_session import empty_session, transition as downtime_transition
 from sdy_persistence import ProductionOutboxSender, ProductionSQLiteStore
 from sdy_shift_schedule import (
     calculate_shift_end_datetime,
+    calculate_shift_start_datetime,
     coerce_bool,
     hour_slot_for_shift_end,
 )
@@ -79,6 +82,7 @@ MQTT_TOPIC_SHIFT_FORM = "nodered/newshift"
 MQTT_TOPIC_SETUP = "nodered/modeltarget" 
 MQTT_TOPIC_NR_REJECT = "nodered/reject"
 MQTT_TOPIC_NR_DOWNTIME = "nodered/downtime"
+MQTT_TOPIC_DOWNTIME_SESSION = "nodered/downtime_session"
 MQTT_TOPIC_NR_ENDSHIFT = "nodered/endshift" 
 MQTT_TOPIC_MODE = "nodered/mode"
 MQTT_TOPIC_PARAM_CONDITION = "noderedparam/condition"
@@ -132,6 +136,12 @@ last_runtime_checkpoint = 0.0
 recovered_from_sqlite = False
 shift_entry_window_started_at = None
 shift_entry_window_ends_at = None
+# Smart Checksheet tablet protocol: a form for a later start waits here, and one
+# shared downtime timer is owned by this program (never by a browser).
+pending_shift_form = None
+downtime_session = empty_session()
+shift_state_lock = threading.RLock()
+last_production_day = (datetime.now() - timedelta(hours=PRODUCTION_DAY_BOUNDARY_HOUR)).date()
 
 current_shift = {
     "shift_id": "NO PROD", "line": "NO PROD", "date": "NO PROD", "shift": "NO PROD", "group": "-",
@@ -220,6 +230,8 @@ def build_runtime_snapshot():
     return {
         "schema_version": 1,
         "current_shift": dict(current_shift),
+        "pending_shift_form": pending_shift_form,
+        "downtime_session": downtime_session,
         "current_mode": current_mode,
         "current_status": current_status,
         "last_sent_hour": last_sent_hour,
@@ -312,6 +324,7 @@ def restore_runtime_state():
     global current_cycle_time, current_mode, current_status, last_sent_hour
     global current_shift, sensor_blocked, recovered_from_sqlite
     global shift_entry_window_started_at, shift_entry_window_ends_at
+    global pending_shift_form, downtime_session
 
     if persistence_store is None:
         return False
@@ -349,6 +362,10 @@ def restore_runtime_state():
     hourly_rest_time = float(timers.get("hourly_rest_time", 0.0))
     lost_time_this_hour = float(timers.get("lost_time_this_hour", 0.0))
     base_time_this_hour = float(timers.get("base_time_this_hour", 0.0))
+    downtime_session = snapshot.get("downtime_session") or empty_session()
+    pending_shift_form = snapshot.get("pending_shift_form")
+    if not isinstance(pending_shift_form, dict):
+        pending_shift_form = None
     current_mode = str(snapshot.get("current_mode", MODE_NORMAL))
     current_status = int(snapshot.get("current_status", STATUS_RUN))
     last_sent_hour = int(snapshot.get("last_sent_hour", -1))
@@ -457,6 +474,8 @@ def reset_shift_data(save_checkpoint=True):
     global current_shift
 
     print("\n[EVENT] Executing Shift Data Reset...")
+    if globals().get("downtime_session", {}).get("status") in {"running", "stopped"}:
+        process_downtime_command({"action": "shift_end"}, automatic=True)
     reset_production_runtime_counters()
     clear_shift_entry_window()
 
@@ -548,6 +567,9 @@ def execute_end_shift(hour_slot_override=None, end_reason="MANUAL SHIFT END"):
         return
 
     print("\n[EVENT] End Shift Triggered!")
+    # Close an open shared downtime session first so its time is logged to this shift.
+    if downtime_session.get("status") in {"running", "stopped"}:
+        process_downtime_command({"action": "shift_end"}, automatic=True)
     if (
         hourly_output != 0
         or base_time_this_hour >= 0.5
@@ -654,13 +676,271 @@ def push_hourly_to_sheets(
         print(f"[MQTT ERROR] Failed to publish finalized hourly row: {exc}")
 
 # ==========================================
+# SMART CHECKSHEET SHIFT FORMS AND SHARED DOWNTIME TIMER
+# ==========================================
+def shift_id_for_form(data):
+    date_clean = str(data.get("prodDate", "")).replace("-", "")
+    return f"{date_clean}-{data.get('shift', '')}-{str(data.get('productionLine', '')).replace(' ', '')}"
+
+
+def parse_operator_names(op_data):
+    if isinstance(op_data, list):
+        return ", ".join(op_data)
+    return str(op_data) if op_data else "-"
+
+
+def publish_shift_form_result(status, data, message="", navigate_to_hourly=True):
+    """Acknowledge every form so the tablet knows it was accepted, queued or refused."""
+    result = {"status": status, "source_payload": data, "message": message,
+              "active_shift": dict(current_shift), "pending_shift": pending_shift_form,
+              "navigate_to_hourly": navigate_to_hourly}
+    try:
+        mqtt_client.publish(f"{LINE_CODE.lower()}/shift_form_result", json.dumps(result), qos=1)
+    except Exception as exc:
+        print(f"[SHIFT ACK ERROR] {exc}")
+
+
+def apply_shift_form(data, navigate_to_hourly=True):
+    """Activate a validated form, preserving a matching late-entry buffer."""
+    global current_shift
+    expire_shift_entry_window()
+    previous_shift_id = current_shift.get("shift_id", "NO PROD")
+    new_shift_id = shift_id_for_form(data)
+    if previous_shift_id != "NO PROD" and previous_shift_id != new_shift_id:
+        print("[SHIFT WARNING] A different shift is already active. The new form was rejected to preserve its counters.")
+        publish_shift_form_result("rejected", data, "Another shift is still active.")
+        return False
+    adopting_shift_buffer = previous_shift_id == "NO PROD" and shift_entry_window_is_active()
+    current_shift["shift_id"] = new_shift_id
+    current_shift["source_form"] = dict(data)
+    current_shift["scheduled_start_at"] = calculate_shift_start_datetime(
+        data.get("prodDate"), data.get("shift"), data.get("overtime", False), data.get("workingTime")
+    ).isoformat()
+    current_shift.update({
+        "date": data.get("prodDate", "-"),
+        "line": data.get("productionLine", "-"),
+        "shift": data.get("shift", "-"),
+        "group": data.get("group", "-"),
+        "workingTime": data.get("workingTime", "-"),
+        "overtime": coerce_bool(data.get("overtime", False)),
+        "supervisor": data.get("supervisor", "-"),
+        "leader": data.get("lineLeader", "-"),
+        "forming": parse_operator_names(data.get("formingOperator")),
+        "waterjet": parse_operator_names(data.get("waterjetOperator")),
+        "assembly": parse_operator_names(data.get("assemblyOperator")),
+        "quality": data.get("qualityOperator", "-"),
+    })
+    try:
+        scheduled_end = calculate_shift_end_datetime(
+            current_shift["date"], current_shift["shift"], current_shift["overtime"], current_shift["workingTime"],
+        )
+        current_shift["scheduled_end_at"] = scheduled_end.isoformat()
+        print(f"[SCHEDULE] Shift will automatically end at {scheduled_end.strftime('%Y-%m-%d %I:%M %p')}.")
+    except ValueError as exc:
+        current_shift["scheduled_end_at"] = None
+        print(f"[SCHEDULE ERROR] Automatic shift end disabled: {exc}")
+    if adopting_shift_buffer:
+        clear_shift_entry_window()
+        print(f"[SHIFT BUFFER] Buffered production assigned to {current_shift['shift_id']} without reset.")
+    print(f"\n[MQTT EVENT] New Shift Started: {current_shift['shift_id']}")
+    queue_google_sheet_row("Shift_Data", [
+        current_shift["shift_id"], current_shift["date"], current_shift["line"],
+        current_shift["shift"], current_shift["group"], current_shift["workingTime"],
+        current_shift["supervisor"], current_shift["leader"],
+        current_shift["forming"], current_shift["waterjet"],
+        current_shift["assembly"], current_shift["quality"],
+    ], data.get("event_id"))
+    checkpoint_and_queue_event(
+        "shift.updated" if previous_shift_id == current_shift["shift_id"] else "shift.started",
+        {
+            "line_code": LINE_CODE,
+            "source_shift_id": current_shift["shift_id"],
+            "shift": dict(current_shift),
+            "source_payload": data,
+        },
+        event_id=data.get("event_id"),
+    )
+    publish_shift_form_result("active", data, navigate_to_hourly=navigate_to_hourly)
+    return True
+
+
+def receive_shift_form(data, moment=None, navigate_to_hourly=True):
+    """Decide what a submitted form means: start now, wait for its start time, or refuse."""
+    global pending_shift_form, last_production_day
+    moment = moment or datetime.now()
+    with shift_state_lock:
+        if data.get("action") == "resend_active":
+            if current_shift.get("shift_id") == "NO PROD":
+                publish_shift_form_result("rejected", data, "There is no active shift to resend.")
+                return False
+            source = current_shift.get("source_form")
+            if not isinstance(source, dict):
+                publish_shift_form_result("rejected", data, "Re-enter the active shift details once before using resend.")
+                return False
+            data = dict(source)
+        try:
+            start = calculate_shift_start_datetime(data.get("prodDate"), data.get("shift"),
+                                                   data.get("overtime", False), data.get("workingTime"))
+            end = calculate_shift_end_datetime(data.get("prodDate"), data.get("shift"),
+                                               data.get("overtime", False), data.get("workingTime"))
+        except (ValueError, TypeError) as exc:
+            publish_shift_form_result("rejected", data, str(exc))
+            return False
+        if moment >= end:
+            publish_shift_form_result("rejected", data, "This shift has already ended. Check the production date.")
+            return False
+        active_end = get_current_shift_end_datetime()
+        new_id = shift_id_for_form(data)
+        if moment < start:
+            if active_end is not None and start < active_end:
+                publish_shift_form_result("rejected", data, "Next shift overlaps the active shift. Check OT and working hours.")
+                return False
+            pending_shift_form = dict(data)
+            checkpoint_runtime_state(force=True, reason="pending shift saved")
+            publish_shift_form_result("pending", data, f"Waiting until {start.isoformat()}")
+            return True
+        if active_end is not None and moment >= active_end:
+            execute_end_shift(hour_slot_override=hour_slot_for_shift_end(active_end),
+                              end_reason="SCHEDULED SHIFT END")
+            start_shift_entry_window(active_end)
+        elif current_shift.get("shift_id") != "NO PROD" and current_shift.get("shift_id") != new_id:
+            publish_shift_form_result("rejected", data, "Another shift is still active.")
+            return False
+        if production_day_key(moment) != last_production_day:
+            force_production_day_reset(moment)
+            last_production_day = production_day_key(moment)
+        if current_shift.get("shift_id") == "NO PROD":
+            buffered_start = parse_shift_entry_datetime(shift_entry_window_started_at)
+            if buffered_start != start:
+                reset_production_runtime_counters()
+                clear_shift_entry_window()
+                start_shift_entry_window(start)
+        # Clear the pending copy before the activation checkpoint, for restart safety.
+        if pending_shift_form is not None and shift_id_for_form(pending_shift_form) == new_id:
+            pending_shift_form = None
+        return apply_shift_form(data, navigate_to_hourly=navigate_to_hourly)
+
+
+def advance_shift_schedule(moment=None):
+    """End finished shifts, apply the production-day reset, then start any pending form that is due."""
+    global last_production_day, pending_shift_form
+    moment = moment or datetime.now()
+    changed = False
+    with shift_state_lock:
+        scheduled_end = get_current_shift_end_datetime()
+        if scheduled_end is not None and moment >= scheduled_end:
+            print(f"[SYSTEM] Scheduled shift end reached: {scheduled_end.isoformat()}")
+            execute_end_shift(hour_slot_override=hour_slot_for_shift_end(scheduled_end),
+                              end_reason="SCHEDULED SHIFT END")
+            start_shift_entry_window(scheduled_end)
+            changed = True
+        production_day = production_day_key(moment)
+        if production_day != last_production_day:
+            force_production_day_reset(moment)
+            last_production_day = production_day
+            changed = True
+        if pending_shift_form is not None:
+            form = dict(pending_shift_form)
+            try:
+                start = calculate_shift_start_datetime(form.get("prodDate"), form.get("shift"),
+                                                       form.get("overtime", False), form.get("workingTime"))
+                end = calculate_shift_end_datetime(form.get("prodDate"), form.get("shift"),
+                                                   form.get("overtime", False), form.get("workingTime"))
+                if moment >= end:
+                    pending_shift_form = None
+                    checkpoint_runtime_state(force=True, reason="expired pending shift discarded")
+                    publish_shift_form_result("rejected", form, "Pending shift expired while offline.")
+                elif moment >= start:
+                    if not receive_shift_form(form, moment, navigate_to_hourly=False):
+                        pending_shift_form = None
+                        checkpoint_runtime_state(force=True, reason="conflicting pending shift discarded")
+                    changed = True
+            except (ValueError, TypeError) as exc:
+                pending_shift_form = None
+                checkpoint_runtime_state(force=True, reason="invalid pending shift discarded")
+                publish_shift_form_result("rejected", form, str(exc))
+    return changed
+
+
+def record_downtime(data):
+    global current_mode
+    if current_mode != MODE_NORMAL:
+        print(f"\n[STATE CHANGE] Downtime logged. Auto-reverting mode: {current_mode} -> {MODE_NORMAL}")
+        current_mode = MODE_NORMAL
+    queue_google_sheet_row("Downtime_Data", [
+        current_shift["shift_id"], get_hour_slot(),
+        data.get("category", ""), data.get("code", ""),
+        data.get("durationMinutes", ""), data.get("description", ""), data.get("remarks", "")
+    ], data.get("event_id"))
+    if current_shift["shift_id"] != "NO PROD":
+        checkpoint_and_queue_event(
+            "downtime.recorded",
+            {
+                "shift_id": current_shift["shift_id"],
+                "line_code": LINE_CODE,
+                "hour_slot": get_hour_slot(),
+                "category": data.get("category", ""),
+                "code": data.get("code", ""),
+                "duration_minutes": data.get("durationMinutes", ""),
+                "description": data.get("description", ""),
+                "remarks": data.get("remarks", ""),
+                "action_taken": data.get("actionTaken", ""),
+            },
+            event_id=data.get("event_id"),
+        )
+    else:
+        checkpoint_runtime_state(force=True, reason="downtime without active shift")
+
+
+def process_downtime_command(command, automatic=False):
+    """Apply one start/stop/log/cancel command to the shared timer and answer on <line>/downtime_result."""
+    global downtime_session, current_mode
+    with shift_state_lock:
+        now_ms = int(time.time() * 1000)
+        result = {"state": downtime_session, "server_ms": now_ms, "mode": current_mode,
+                  "event": None, "log": None, "error": "", "command_id": command.get("command_id"),
+                  "client": command.get("client")}
+        try:
+            updated, effects = downtime_transition(downtime_session, command, now_ms,
+                                                    current_shift.get("shift_id", "NO PROD"), automatic)
+            if effects["mode"] == MODE_MODEL_CHANGE and current_mode != MODE_MODEL_CHANGE:
+                push_hourly_to_sheets(is_model_change=True)
+            downtime_session = updated
+            if effects["mode"] is not None:
+                current_mode = effects["mode"]
+            if effects["log"] is not None:
+                record_downtime(effects["log"])
+            elif command.get("action") != "get":
+                checkpoint_runtime_state(force=True, reason="shared downtime session")
+            result.update(state=downtime_session)
+            result.update(effects)
+            result["mode_changed"] = effects["mode"] is not None
+            result["mode"] = current_mode
+        except (ValueError, TypeError) as exc:
+            result["error"] = str(exc)
+        try:
+            mqtt_client.publish(f"{LINE_CODE.lower()}/downtime_result", json.dumps(result), qos=1)
+        except Exception as exc:
+            print(f"[DOWNTIME ACK ERROR] {exc}")
+        return result
+
+
+def finish_due_downtime():
+    with shift_state_lock:
+        if downtime_session.get("status") == "running" and downtime_session.get("target_ms") is not None:
+            if time.time() * 1000 >= downtime_session["target_ms"]:
+                process_downtime_command({"action": "expire"}, automatic=True)
+
+
+# ==========================================
 # MQTT CALLBACKS
 # ==========================================
 def on_connect(client, userdata, flags, rc):
-    client.subscribe([(MQTT_TOPIC_SHIFT_FORM, 0), (MQTT_TOPIC_SETUP, 0), 
-                      (MQTT_TOPIC_NR_REJECT, 0), (MQTT_TOPIC_NR_DOWNTIME, 0), 
+    client.subscribe([(MQTT_TOPIC_SHIFT_FORM, 0), (MQTT_TOPIC_SETUP, 0),
+                      (MQTT_TOPIC_NR_REJECT, 0), (MQTT_TOPIC_NR_DOWNTIME, 0),
                       (MQTT_TOPIC_NR_ENDSHIFT, 0), (MQTT_TOPIC_MODE, 0),
-                      (MQTT_TOPIC_PARAM_CONDITION, 0), (MQTT_TOPIC_ADJUST_COUNT, 0)])
+                      (MQTT_TOPIC_PARAM_CONDITION, 0), (MQTT_TOPIC_ADJUST_COUNT, 0),
+                      (MQTT_TOPIC_DOWNTIME_SESSION, 1)])
     client.publish(
         MQTT_TOPIC_STATUS,
         json.dumps({
@@ -684,89 +964,23 @@ def on_message(client, userdata, msg):
         try: data = json.loads(payload_str); is_json = True
         except ValueError: data = payload_str; is_json = False
 
-        if topic == MQTT_TOPIC_SHIFT_FORM and is_json:
-            expire_shift_entry_window()
-            previous_shift_details = dict(current_shift)
-            previous_shift_id = current_shift.get("shift_id", "NO PROD")
-            date_clean = data.get("prodDate", "").replace("-", "")
-            new_shift_id = f"{date_clean}-{data.get('shift', '')}-{data.get('productionLine', '').replace(' ', '')}"
-            if previous_shift_id != "NO PROD" and previous_shift_id != new_shift_id:
-                print(
-                    "[SHIFT WARNING] A different shift is already active. "
-                    "The form was rejected to preserve its counters."
-                )
-                return
-            adopting_shift_buffer = (
-                previous_shift_id == "NO PROD" and shift_entry_window_is_active()
-            )
-            
-            def parse_ops(op_data):
-                if isinstance(op_data, list): return ", ".join(op_data)
-                return str(op_data) if op_data else "-"
+        if is_json and isinstance(data, dict) and coerce_bool(data.get("testMode", False)):
+            print("[TEST] Command ignored; production state is unchanged.")
+            return
 
-            current_shift.update({
-                "shift_id": new_shift_id,
-                "date": data.get("prodDate", "-"),
-                "line": data.get("productionLine", "-"),
-                "shift": data.get("shift", "-"),
-                "group": data.get("group", "-"),
-                "workingTime": data.get("workingTime", "-"),
-                "overtime": coerce_bool(data.get("overtime", False)),
-                "supervisor": data.get("supervisor", "-"),
-                "leader": data.get("lineLeader", "-"),
-                "forming": parse_ops(data.get("formingOperator")),
-                "waterjet": parse_ops(data.get("waterjetOperator")),
-                "assembly": parse_ops(data.get("assemblyOperator")),
-                "quality": data.get("qualityOperator", "-"),
-            })
-            try:
-                scheduled_end = calculate_shift_end_datetime(
-                    current_shift["date"],
-                    current_shift["shift"],
-                    current_shift["overtime"],
-                    current_shift["workingTime"],
-                )
-                if scheduled_end <= datetime.now():
-                    raise ValueError(
-                        f"calculated shift end {scheduled_end.isoformat()} is already past"
-                    )
-                current_shift["scheduled_end_at"] = scheduled_end.isoformat()
-                print(
-                    "[SCHEDULE] Shift will automatically end at "
-                    f"{scheduled_end.strftime('%Y-%m-%d %I:%M %p')}."
-                )
-            except ValueError as exc:
-                current_shift = previous_shift_details
-                print(f"[SHIFT ERROR] Shift form rejected: {exc}")
-                return
+        if topic == MQTT_TOPIC_DOWNTIME_SESSION and is_json:
+            process_downtime_command(data)
 
-            if adopting_shift_buffer:
-                clear_shift_entry_window()
-                print("[SHIFT BUFFER] Buffered production assigned without reset.")
-
-            row_data = [
-                current_shift["shift_id"], current_shift["date"], current_shift["line"],
-                current_shift["shift"], current_shift["group"], current_shift["workingTime"],
-                current_shift["supervisor"], current_shift["leader"],
-                current_shift["forming"], current_shift["waterjet"],
-                current_shift["assembly"], current_shift["quality"],
-            ]
-            queue_google_sheet_row("Shift_Data", row_data, data.get("event_id"))
-            checkpoint_and_queue_event(
-                "shift.updated" if previous_shift_id == new_shift_id else "shift.started",
-                {
-                    "line_code": LINE_CODE,
-                    "source_shift_id": new_shift_id,
-                    "shift": dict(current_shift),
-                    "source_payload": data,
-                },
-                event_id=data.get("event_id"),
-            )
+        elif topic == MQTT_TOPIC_SHIFT_FORM and is_json:
+            receive_shift_form(data)
 
         elif topic == MQTT_TOPIC_SETUP and is_json:
             if "model" in data: current_shift["model"] = data.get("model", "-")
             if "lot_number" in data: current_shift["lot_number"] = data.get("lot_number", "-")
-            if "total_target" in data: current_shift["target"] = data.get("total_target", 0)
+            if "hourly_plan" in data:
+                current_shift["target"] = data.get("hourly_plan", 0)
+            elif "total_target" in data:
+                current_shift["target"] = data.get("total_target", 0)
             if "standard_cycle" in data: current_shift["standard_cycle"] = float(data.get("standard_cycle", 1.0))
             if current_shift["shift_id"] != "NO PROD":
                 checkpoint_and_queue_event(
@@ -804,7 +1018,14 @@ def on_message(client, userdata, msg):
                         "shift_id": current_shift["shift_id"],
                         "line_code": LINE_CODE,
                         "hour_slot": get_hour_slot(),
+                        "slab_quantity": data.get("totalSlabReject", ""),
+                        "slab_code": data.get("slabRejectCode", ""),
+                        "return_roll_quantity": data.get("totalReturnRoll", ""),
+                        "oht_number": data.get("ohtNumber", ""),
                         "ng_quantity": data.get("totalRejectNG", ""),
+                        "ng_code": data.get("ngRejectCode", ""),
+                        "loft_quantity": data.get("totalLoftLayerReject", ""),
+                        "loft_code": data.get("loftLayerRejectCode", ""),
                         "source_payload": data,
                     },
                     event_id=data.get("event_id"),
@@ -813,30 +1034,7 @@ def on_message(client, userdata, msg):
                 checkpoint_runtime_state(force=True, reason="reject without active shift")
 
         elif topic == MQTT_TOPIC_NR_DOWNTIME and is_json:
-            if current_mode != MODE_NORMAL:
-                current_mode = MODE_NORMAL
-                
-            row_data = [
-                current_shift["shift_id"], get_hour_slot(), 
-                data.get("category", ""), data.get("code", ""), 
-                data.get("durationMinutes", ""), data.get("description", ""), data.get("remarks", "")
-            ]
-            queue_google_sheet_row("Downtime_Data", row_data, data.get("event_id"))
-            if current_shift["shift_id"] != "NO PROD":
-                checkpoint_and_queue_event(
-                    "downtime.recorded",
-                    {
-                        "shift_id": current_shift["shift_id"],
-                        "line_code": LINE_CODE,
-                        "hour_slot": get_hour_slot(),
-                        "category": data.get("category", ""),
-                        "code": data.get("code", ""),
-                        "duration_minutes": data.get("durationMinutes", ""),
-                        "description": data.get("description", ""),
-                        "remarks": data.get("remarks", ""),
-                    },
-                    event_id=data.get("event_id"),
-                )
+            record_downtime(data)
 
         elif topic == MQTT_TOPIC_NR_ENDSHIFT:
             is_end = data.get("value", False) if isinstance(data, dict) else data
@@ -865,12 +1063,24 @@ def on_message(client, userdata, msg):
                         "shift_id": current_shift["shift_id"],
                         "line_code": LINE_CODE,
                         "model": model,
+                        "heating": param_data.get("heating", ""),
+                        "cooling": param_data.get("cooling", ""),
+                        "shuttle": param_data.get("shuttle", ""),
+                        "waterjet": param_data.get("waterjet", ""),
+                        "rh": temp_data.get("rh", ""),
+                        "ctr": temp_data.get("ctr", ""),
+                        "lh": temp_data.get("lh", ""),
+                        "glue_standard": glue_data.get("std", ""),
+                        "glue_actual": glue_data.get("act", ""),
                         "source_payload": data,
                     },
                     event_id=data.get("event_id"),
                 )
 
         elif topic == MQTT_TOPIC_MODE:
+            if downtime_session.get("status") == "running":
+                print("[MODE WARNING] Stop the shared downtime timer before changing mode.")
+                return
             new_mode = str(data).upper()
             valid_modes = [MODE_NORMAL, MODE_DOWN, MODE_MODEL_CHANGE, MODE_REST, MODE_PLANNED_STOP]
             if new_mode in valid_modes:
@@ -885,8 +1095,37 @@ def on_message(client, userdata, msg):
         elif topic == MQTT_TOPIC_ADJUST_COUNT and is_json:
             action = data.get("action", "")
             amount = safe_int(data.get("amount", 1)) 
-            
-            if action == "decrease":
+
+            if "adjust" in data and not action:
+                adjust_val = safe_int(data.get("adjust", 0))
+                if adjust_val not in (1, -1):
+                    print(f"[COUNT WARNING] Ignored adjustment {adjust_val!r}; use +1 or -1.")
+                    return
+                print(f"[EVENT] Manual Count Adjustment from tablet: {adjust_val:+d}")
+                hourly_output = max(0, hourly_output + adjust_val)
+                total_output = max(0, total_output + adjust_val)
+                shift_total_output = max(0, shift_total_output + adjust_val)
+                current_cycle_time = (batch_run_time / total_output) / 60.0 if total_output > 0 else 0.0
+                if current_shift["shift_id"] != "NO PROD":
+                    checkpoint_and_queue_event(
+                        "count.adjusted",
+                        {
+                            "shift_id": current_shift["shift_id"],
+                            "line_code": LINE_CODE,
+                            "adjustment": adjust_val,
+                            "hourly_output_after": hourly_output,
+                            "model_output_after": total_output,
+                            "shift_output_after": shift_total_output,
+                            "reason": data.get("reason", ""),
+                            "operator": data.get("operator", ""),
+                            "source_payload": data,
+                        },
+                        event_id=data.get("event_id"),
+                    )
+                else:
+                    checkpoint_runtime_state(force=True, reason="count adjustment without active shift")
+
+            elif action == "decrease":
                 print(f"\n[EVENT] Manual Count Decrease Triggered. Amount: {amount}")
                 
                 if total_output >= amount:
@@ -1006,8 +1245,17 @@ def process_gsheets_queue():
 def publish_live_data():
     global last_live_snapshot_publish
 
+    # Same available-time formula used by push_hourly_to_sheets().
+    standard_cycle = current_shift.get("standard_cycle", 1.0)
+    live_base_minutes = base_time_this_hour / 60.0
+    live_lost_minutes = lost_time_this_hour / 60.0
+    live_available_minutes = max(0.0, live_base_minutes - live_lost_minutes)
+    live_plan = int(live_available_minutes / standard_cycle) if standard_cycle > 0 else 0
+    full_hour_plan = int(60.0 / standard_cycle) if standard_cycle > 0 else 0
+
     payload = {
         "shift_id": current_shift["shift_id"],
+        "line_code": LINE_CODE,
         "hour_slot": get_hour_slot(),
         "line": current_shift["line"],
         "date": current_shift["date"],
@@ -1016,13 +1264,30 @@ def publish_live_data():
         "working_time": current_shift["workingTime"],
         "overtime": current_shift.get("overtime", False),
         "scheduled_end_at": current_shift.get("scheduled_end_at"),
+        "scheduled_start_at": current_shift.get("scheduled_start_at"),
+        "pending_shift": pending_shift_form,
+        "downtime_session": downtime_session,
+        "server_ms": int(time.time() * 1000),
+        "persistence_enabled": persistence_store is not None,
+        "supervisor": current_shift["supervisor"],
+        "leader": current_shift["leader"],
+        "forming_operator": current_shift["forming"],
+        "waterjet_operator": current_shift["waterjet"],
+        "assembly_operator": current_shift["assembly"],
+        "quality_inspector": current_shift["quality"],
         "model": current_shift["model"],
         "lot_number": current_shift["lot_number"],
+        "hourly_plan": current_shift.get("target", 0),
         "machine_status": current_status,
         "current_mode": current_mode,
         "product_count": total_output, 
         "total_product_count": shift_total_output,
         "hourly_output": hourly_output,
+        "live_plan": live_plan,
+        "full_hour_plan": full_hour_plan,
+        "hour_base_minutes": round(live_base_minutes, 2),
+        "hour_lost_minutes": round(live_lost_minutes, 2),
+        "hour_available_minutes": round(live_available_minutes, 2),
         "total_reject": total_rejects,
         "recovered_from_sqlite": recovered_from_sqlite,
         "shift_entry_status": (
@@ -1066,7 +1331,6 @@ print("=====================================================")
 last_loop_time = time.time()
 last_debug_print_time = time.time()
 limit_switch_prev = GPIO.input(LIMIT_SWITCH_PIN)
-last_production_day = production_day_key(datetime.now())
 
 try:
     while True:
@@ -1077,20 +1341,12 @@ try:
         now = datetime.now()
         expire_shift_entry_window(now)
 
-        scheduled_shift_end = get_current_shift_end_datetime()
-        if scheduled_shift_end is not None and now >= scheduled_shift_end:
-            execute_end_shift(
-                hour_slot_override=hour_slot_for_shift_end(scheduled_shift_end),
-                end_reason="SCHEDULED SHIFT END",
-            )
-            start_shift_entry_window(scheduled_shift_end)
+        # This program owns shift end/start and the production-day reset,
+        # including a form the tablet submitted for a later start.
+        if advance_shift_schedule(now):
             continue
 
-        current_production_day = production_day_key(now)
-        if current_production_day != last_production_day:
-            force_production_day_reset(now)
-            last_production_day = current_production_day
-            continue
+        finish_due_downtime()
 
         # 1. Check for Standard Hourly Push
         if (

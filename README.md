@@ -112,3 +112,23 @@ retries by `request_id`. Run `node tests/test_sdy1_appscript.js` before deployme
 After changing `appScriptSdy1.js`, create a new Apps Script web-app deployment
 version; saving the editor is not enough. Confirm the deployed `/exec` URL still
 matches `WEB_APP_URL`, then update and restart the Raspberry Pi service.
+
+## Smart Checksheet tablet connection
+
+The tracker speaks the same protocol as the ABB trackers, so the Smart Checksheet
+tablet app can drive it:
+
+- Live snapshots on `smartchecksheet/live` include `line_code: SDY1`, the shift
+  crew, `hourly_plan`, `live_plan`, the pending shift and the shared downtime timer.
+- Every submitted shift form is answered on `sdy1/shift_form_result` as `active`,
+  `pending` (a form for a later start waits and starts by itself) or `rejected`
+  with a reason. A running timer is closed and logged when the shift ends.
+- The shared downtime timer is controlled on `nodered/downtime_session` and
+  answered on `sdy1/downtime_result`; the machine mode cannot be changed while it
+  runs. `deploy`-time restarts keep the pending form and the timer (SQLite).
+- The tablet's count correction (`{"adjust": 1}` or `-1`) is accepted, and reject
+  and parameter events carry the individual readings the tablet displays.
+
+New files: `sdy_downtime_session.py` and `tests/test_tablet_protocol.py` (runs the
+tracker with fake GPIO/MQTT: `python -m unittest discover -s tests`). This was
+tested with mocked hardware only; verify on the Pi during a planned stop.
