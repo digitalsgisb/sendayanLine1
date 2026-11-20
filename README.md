@@ -19,14 +19,17 @@ while adding the same production lifecycle safeguards used by the ABB trackers.
 
 ## Counting
 
-- **Waterjet (main output):** prox sensor 1 (GPIO 5) is waterjet A and prox
-  sensor 2 (GPIO 27) is waterjet B. A cycle is block -> unblock -> block: the
-  first block after startup only arms the sensor, and every later
-  unblock -> block counts one product, at most once per 2 seconds per waterjet.
-  Waterjet A + B is the main output: `hourly_output`, `product_count`,
-  `total_product_count`, the Hourly_Data "actual" column, the PDF, and the
-  cycle time (`batch_run_time / total_output`) all use it. Tablet count
-  adjustments change this count.
+- **Waterjet (main output)**, using the timing tuned on site in Nov 2026:
+  - **WJ1** (prox sensor 1, GPIO 5): HIGH continuously for 2.0 s arms a cycle,
+    then LOW continuously for 1.5 s counts one product. Brief HIGH blips while
+    LOW only restart the 1.5 s. It starts disarmed after a restart and disarms
+    outside NORMAL production.
+  - **WJ2** (prox sensor 2, GPIO 27): every HIGH -> LOW edge counts, at most
+    once per 0.15 s.
+  - Both are sampled about every 50 ms. WJ1 + WJ2 is the main output:
+    `hourly_output`, `product_count`, `total_product_count`, the Hourly_Data
+    "actual" column, the PDF, and the cycle time (`batch_run_time / total_output`).
+    Tablet count adjustments change this count.
 - **Forming:** the limit switch (GPIO 26) counts `forming_output` for the live
   panel only (also in the MQTT payload and the `shift.ended` event). It is not
   written to the Sheet or PDF.
@@ -34,8 +37,10 @@ while adding the same production lifecycle safeguards used by the ABB trackers.
 - Machine status is unchanged: both prox sensors blocked = LOADING, then DELAY
   after 10 seconds; otherwise RUN.
 
-The live payload adds `waterjet_output`, `waterjet_a_output`,
-`waterjet_b_output` and `forming_output`.
+The live payload adds shift totals `waterjet_output`, `waterjet_a_output`,
+`waterjet_b_output` and `forming_output` (Smart Checksheet panels), and keeps the
+site fields `wj1_count`, `wj2_count`, `wj_total_count` and `mf_count`
+(model counts, reset on model change).
 
 ## Google Sheets sending
 

@@ -34,7 +34,10 @@ GPIO.setup(LIMIT_SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 SENSOR_DEBOUNCE_TIME = 0.05
 LIMIT_SWITCH_COUNT_DEBOUNCE_TIME = 2.0
-WATERJET_COUNT_DEBOUNCE_TIME = 2.0
+# Waterjet timing tuned on site (Sendayan Line 1, Nov 2026). Keep these values.
+WJ_COUNT_DEBOUNCE_TIME = 0.15  # WJ2 only; leave its existing behavior unchanged
+WJ1_ARM_HIGH_SECONDS = 2.0  # continuous HIGH required to begin a new cutting cycle
+WJ1_CONFIRM_LOW_SECONDS = 1.5  # continuous LOW required to confirm completion
 
 # ==========================================
 # GLOBAL VARIABLES & COUNTERS
@@ -57,9 +60,12 @@ total_output = 0            # Waterjet product count (resets on model change)
 shift_total_output = 0      # Waterjet product count (resets on shift end only)
 hourly_output = 0           # Waterjet product count this hour
 total_rejects = 0           # Sum of dashboard rejects received via MQTT
-waterjet_a_output = 0       # Shift total from prox sensor 1 (waterjet A)
-waterjet_b_output = 0       # Shift total from prox sensor 2 (waterjet B)
-forming_output = 0          # Shift total from the forming limit switch (live panel only)
+waterjet_a_output = 0       # WJ1 shift total (GPIO5), resets on shift end only
+waterjet_b_output = 0       # WJ2 shift total (GPIO27), resets on shift end only
+forming_output = 0          # Forming shift total (GPIO26), live panel only
+mf_count = 0                # Forming model count (GPIO26), resets on model change too
+wj1_count = 0               # Waterjet 1 model count (GPIO5)
+wj2_count = 0               # Waterjet 2 model count (GPIO27)
 
 # Hourly Trackers
 hourly_rest_time = 0.0
@@ -73,13 +79,15 @@ current_cycle_time = 0.0
 limit_switch_prev = 1       # Assumes 1 (HIGH) is unpressed
 last_limit_switch_count_time = 0.0
 
-# Waterjet cycle detection, one entry per waterjet. A cycle is block -> unblock ->
-# block: the first block seen after startup only arms the sensor, and every later
-# unblock -> block transition counts one product.
-waterjet_sensors = {
-    "A": {"pin": PROX_SENSOR_1_PIN, "prev_blocked": None, "armed": False, "last_count_time": 0.0},
-    "B": {"pin": PROX_SENSOR_2_PIN, "prev_blocked": None, "armed": False, "last_count_time": 0.0},
-}
+wj1_prev = GPIO.input(PROX_SENSOR_1_PIN)
+wj2_prev = GPIO.input(PROX_SENSOR_2_PIN)
+last_wj1_count_time = 0.0
+last_wj2_count_time = 0.0
+# WJ1 starts disarmed, including after process restart. Do not infer a product
+# from a LOW level until a full qualifying HIGH -> LOW cycle is observed.
+wj1_armed = False
+wj1_high_since = None
+wj1_low_since = None
 
 # ==========================================
 # MQTT & GOOGLE SHEETS CONFIGURATION
@@ -308,6 +316,9 @@ def build_runtime_snapshot():
             "waterjet_a_output": waterjet_a_output,
             "waterjet_b_output": waterjet_b_output,
             "forming_output": forming_output,
+            "mf_count": mf_count,
+            "wj1_count": wj1_count,
+            "wj2_count": wj2_count,
         },
         "cycle": {"current_cycle_time": current_cycle_time},
         "timers": {
@@ -383,7 +394,7 @@ def restore_runtime_state():
     global total_rest_time, planned_stop_time, model_change_time, total_machine_time
     global real_operating_time, total_real_operating_time, batch_run_time
     global total_output, shift_total_output, hourly_output, total_rejects
-    global waterjet_a_output, waterjet_b_output, forming_output
+    global waterjet_a_output, waterjet_b_output, forming_output, mf_count, wj1_count, wj2_count
     global hourly_rest_time, lost_time_this_hour, base_time_this_hour
     global current_cycle_time, current_mode, current_status, last_sent_hour
     global current_shift, sensor_blocked, recovered_from_sqlite
@@ -414,6 +425,9 @@ def restore_runtime_state():
     waterjet_a_output = int(counters.get("waterjet_a_output", 0))
     waterjet_b_output = int(counters.get("waterjet_b_output", 0))
     forming_output = int(counters.get("forming_output", 0))
+    mf_count = int(counters.get("mf_count", total_output))
+    wj1_count = int(counters.get("wj1_count", 0))
+    wj2_count = int(counters.get("wj2_count", 0))
     current_cycle_time = float(snapshot.get("cycle", {}).get("current_cycle_time", 0.0))
     run_time = float(timers.get("run_time", 0.0))
     loading_time = float(timers.get("loading_time", 0.0))
@@ -447,67 +461,96 @@ def restore_runtime_state():
     )
     return True
 
-def read_stable_prox_sensors():
+def reset_wj1_cycle_qualification():
+    """Require a fresh HIGH interval after a model transition."""
+    global wj1_armed, wj1_high_since, wj1_low_since
+    wj1_armed = False
+    wj1_high_since = None
+    wj1_low_since = None
+
+
+def record_waterjet_product(name, sample_time):
+    """One finished waterjet cycle: the main output (hourly, model, shift) plus per-waterjet totals."""
+    global wj1_count, wj2_count, waterjet_a_output, waterjet_b_output
+    global hourly_output, total_output, shift_total_output, current_cycle_time
+    global last_wj1_count_time, last_wj2_count_time
+    if name == "WJ1":
+        wj1_count += 1
+        waterjet_a_output += 1
+        last_wj1_count_time = sample_time
+    else:
+        wj2_count += 1
+        waterjet_b_output += 1
+        last_wj2_count_time = sample_time
+    hourly_output += 1
+    total_output += 1
+    shift_total_output += 1
+    current_cycle_time = (batch_run_time / total_output) / 60.0
+    checkpoint_runtime_state(force=True, reason=f"{name} confirmed cycle")
+    print(f"[{name}] Product +1 | WJ1: {wj1_count} | WJ2: {wj2_count} | "
+          f"Model: {total_output} | Shift: {shift_total_output}")
+
+
+def apply_waterjet_sample(p1, p2, sample_time, accept_counts=False):
+    """WJ1 cycle-aware counting; WJ2 keeps its original edge counter (site logic)."""
+    global wj1_prev, wj2_prev, wj1_armed, wj1_high_since, wj1_low_since
+
+    # WJ1: require sustained HIGH to arm, then sustained LOW to count once.
+    # Ignore brief HIGH chatter after the sensor arrives at LOW.
+    # Disarm while REST/DOWN/other modes; a new full cycle is required in NORMAL.
+    wj1_completed = False
+    if not accept_counts:
+        wj1_armed = False
+        wj1_high_since = None
+        wj1_low_since = None
+    elif p1 == 1:
+        wj1_low_since = None
+        if wj1_high_since is None:
+            wj1_high_since = sample_time
+        if not wj1_armed and sample_time - wj1_high_since >= WJ1_ARM_HIGH_SECONDS:
+            wj1_armed = True
+    else:  # WJ1 GPIO5 LOW: finished/stopped position
+        wj1_high_since = None
+        if wj1_armed:
+            if wj1_low_since is None:
+                wj1_low_since = sample_time
+            if sample_time - wj1_low_since >= WJ1_CONFIRM_LOW_SECONDS:
+                wj1_completed = True
+                wj1_armed = False
+                wj1_low_since = None
+        else:
+            wj1_low_since = None
+
+    if wj1_completed:
+        record_waterjet_product("WJ1", sample_time)
+
+    # WJ2: original HIGH -> LOW edge with 150 ms debounce, unchanged.
+    if (accept_counts and wj2_prev == 1 and p2 == 0
+            and sample_time - last_wj2_count_time >= WJ_COUNT_DEBOUNCE_TIME):
+        record_waterjet_product("WJ2", sample_time)
+
+    wj1_prev, wj2_prev = p1, p2
+    return p1, p2
+
+
+def sample_waterjet_inputs(accept_counts=False):
+    p1 = GPIO.input(PROX_SENSOR_1_PIN)
+    p2 = GPIO.input(PROX_SENSOR_2_PIN)
+    return apply_waterjet_sample(p1, p2, time.monotonic(), accept_counts)
+
+
+def get_stable_machine_state(accept_counts=False):
+    """Keep original machine-state rule: BOTH proximity sensors LOW in 3/5 samples.
+
+    Every sample also feeds the waterjet counters (about every 50 ms).
     """
-    Samples Prox Sensor 1 and Prox Sensor 2 five times (majority vote).
-    Returns (waterjet_a_blocked, waterjet_b_blocked, both_blocked).
-    Pins read 1 when clear and 0 when a product is present.
-    """
-    stable_readings = 5
-    a_blocked = b_blocked = both_blocked = 0
-    for _ in range(stable_readings):
-        p1 = GPIO.input(PROX_SENSOR_1_PIN)
-        p2 = GPIO.input(PROX_SENSOR_2_PIN)
-        a_blocked += p1 == 0
-        b_blocked += p2 == 0
-        both_blocked += p1 == 0 and p2 == 0
+    blocked_count = 0
+    for _ in range(5):
+        p1, p2 = sample_waterjet_inputs(accept_counts=accept_counts)
+        if p1 == 0 and p2 == 0:
+            blocked_count += 1
         time.sleep(SENSOR_DEBOUNCE_TIME)
-    majority = stable_readings // 2 + 1
-    return a_blocked >= majority, b_blocked >= majority, both_blocked >= majority
-
-
-def get_stable_machine_state(prox_reading=None):
-    """
-    Checks Prox Sensor 1 and Prox Sensor 2.
-    If BOTH are blocked, the machine is considered blocked.
-    """
-    prox_reading = prox_reading or read_stable_prox_sensors()
-    return 1 if prox_reading[2] else 0
-
-
-def update_waterjet_counts(a_blocked, b_blocked, current_time, counting_enabled):
-    """Apply one stable reading to both waterjets; returns how many products were counted.
-
-    The first block after startup only arms a waterjet. After that every
-    unblock -> block transition is one finished cycle, at most one per
-    WATERJET_COUNT_DEBOUNCE_TIME. Transitions outside NORMAL production are
-    tracked (so they are not counted later) but never counted.
-    """
-    global hourly_output, total_output, shift_total_output, waterjet_a_output, waterjet_b_output
-    counted = 0
-    for name, blocked in (("A", a_blocked), ("B", b_blocked)):
-        sensor = waterjet_sensors[name]
-        new_block = blocked and sensor["prev_blocked"] is False
-        first_block = blocked and not sensor["armed"]
-        sensor["prev_blocked"] = blocked
-        if first_block:
-            sensor["armed"] = True
-            print(f"[SENSOR] Waterjet {name} armed (first block after startup is not counted).")
-            continue
-        if (new_block and counting_enabled and
-                current_time - sensor["last_count_time"] >= WATERJET_COUNT_DEBOUNCE_TIME):
-            sensor["last_count_time"] = current_time
-            hourly_output += 1
-            total_output += 1
-            shift_total_output += 1
-            if name == "A":
-                waterjet_a_output += 1
-            else:
-                waterjet_b_output += 1
-            counted += 1
-            print(f"\n[SENSOR] Waterjet {name} cycle counted! Total (Model): {total_output} | "
-                  f"Total (Shift): {shift_total_output} | A={waterjet_a_output} B={waterjet_b_output}")
-    return counted
+    return 1 if blocked_count > 2 else 0
 
 
 def reset_production_runtime_counters():
@@ -515,12 +558,17 @@ def reset_production_runtime_counters():
     global total_machine_time, total_output, hourly_output, hourly_rest_time, lost_time_this_hour, base_time_this_hour, sensor_blocked
     global shift_total_output, total_rejects, current_cycle_time, real_operating_time, limit_switch_prev
     global total_real_operating_time, batch_run_time, last_sent_hour
-    global waterjet_a_output, waterjet_b_output, forming_output
+    global waterjet_a_output, waterjet_b_output, forming_output, mf_count, wj1_count, wj2_count
+    global wj1_prev, wj2_prev
 
     run_time = loading_time = delay_time = downtime = 0.0
     total_rest_time = planned_stop_time = model_change_time = total_machine_time = 0.0
     total_output = hourly_output = shift_total_output = total_rejects = 0
     waterjet_a_output = waterjet_b_output = forming_output = 0
+    mf_count = wj1_count = wj2_count = 0
+    wj1_prev = GPIO.input(PROX_SENSOR_1_PIN)
+    wj2_prev = GPIO.input(PROX_SENSOR_2_PIN)
+    reset_wj1_cycle_qualification()
     hourly_rest_time = lost_time_this_hour = base_time_this_hour = 0.0
     real_operating_time = total_real_operating_time = current_cycle_time = batch_run_time = 0.0
     sensor_blocked = False
@@ -704,6 +752,9 @@ def execute_end_shift(hour_slot_override=None, end_reason="MANUAL SHIFT END"):
         "waterjet_a_output": waterjet_a_output,
         "waterjet_b_output": waterjet_b_output,
         "forming_output": forming_output,
+        "wj1_count": wj1_count,
+        "wj2_count": wj2_count,
+        "mf_count": mf_count,
         "total_rejects": total_rejects,
         "end_reason": end_reason,
         "ended_at": datetime.now().astimezone().isoformat(),
@@ -724,7 +775,7 @@ def push_hourly_to_sheets(
     hour_slot_override=None,
     reason_override=None,
 ):
-    global hourly_output, lost_time_this_hour, base_time_this_hour, total_output, hourly_rest_time, batch_run_time, real_operating_time
+    global hourly_output, lost_time_this_hour, base_time_this_hour, total_output, hourly_rest_time, batch_run_time, real_operating_time, mf_count, wj1_count, wj2_count
     
     std_cycle = current_shift.get("standard_cycle", 1.0)
     base_minutes = base_time_this_hour / 60.0
@@ -780,6 +831,10 @@ def push_hourly_to_sheets(
     if is_model_change:
         print("[EVENT] Model Change Flag triggered -> Resetting Total Output and Real Operating Time to 0.")
         total_output = 0 
+        mf_count = 0
+        wj1_count = wj2_count = 0
+        # Reset WJ1 cycle qualification at model change; restart on next full cycle.
+        reset_wj1_cycle_qualification()
         batch_run_time = 0.0      
         real_operating_time = 0.0 
 
@@ -1414,6 +1469,10 @@ def publish_live_data():
         "waterjet_a_output": waterjet_a_output,
         "waterjet_b_output": waterjet_b_output,
         "forming_output": forming_output,
+        "mf_count": mf_count,
+        "wj1_count": wj1_count,
+        "wj2_count": wj2_count,
+        "wj_total_count": wj1_count + wj2_count,
         "google_sheets_url_source": google_web_app_url_source,
         "google_queue_length": google_queue_length(),
         "live_plan": live_plan,
@@ -1464,6 +1523,8 @@ print("=====================================================")
 last_loop_time = time.time()
 last_debug_print_time = time.time()
 limit_switch_prev = GPIO.input(LIMIT_SWITCH_PIN)
+wj1_prev = GPIO.input(PROX_SENSOR_1_PIN)
+wj2_prev = GPIO.input(PROX_SENSOR_2_PIN)
 
 try:
     while True:
@@ -1509,17 +1570,6 @@ try:
         if current_mode == MODE_NORMAL:
             batch_run_time += production_loop_delta
 
-        # --- MAIN OUTPUT: WATERJET COUNTING (Prox Sensors 1 & 2) ---
-        # Read in every mode so a block during REST/DOWN is never counted later.
-        prox_reading = read_stable_prox_sensors()
-        if update_waterjet_counts(prox_reading[0], prox_reading[1], current_time,
-                                  current_mode == MODE_NORMAL and production_tracking_enabled):
-            # Cycle time follows the waterjet output.
-            if total_output > 0:
-                current_cycle_time = (batch_run_time / total_output) / 60.0
-            checkpoint_runtime_state(force=True, reason="waterjet product detection")
-
-        if current_mode == MODE_NORMAL:
             # --- FORMING COUNTING (Sensor 3 / Limit Switch): live panel only ---
             limit_switch_current = GPIO.input(LIMIT_SWITCH_PIN)
             # Detects transition from UNBLOCKED (1) to BLOCKED (0)
@@ -1527,14 +1577,16 @@ try:
                     current_time - last_limit_switch_count_time >= LIMIT_SWITCH_COUNT_DEBOUNCE_TIME and
                     production_tracking_enabled):
                 forming_output += 1
+                mf_count += 1
                 last_limit_switch_count_time = current_time
-                checkpoint_runtime_state(force=True, reason="forming product detection")
-                print(f"\n[SENSOR] Forming Counted via Limit Switch! Forming (Shift): {forming_output}")
+                checkpoint_runtime_state(force=True, reason="MF detection")
+                print(f"[LIMIT] MF: {mf_count} | Forming (Shift): {forming_output} | WJ Product: {total_output}")
 
             limit_switch_prev = limit_switch_current
 
             # --- STATE LOGIC (Prox Sensors 1 & 2, unchanged: both blocked = loading/delay) ---
-            current_machine_state = get_stable_machine_state(prox_reading)
+            # MAIN OUTPUT: every one of these samples also counts WJ1 / WJ2 (site logic).
+            current_machine_state = get_stable_machine_state(accept_counts=production_tracking_enabled)
 
             if current_machine_state == 1: # BLOCKED (Either prox sensor blocked)
                 if not sensor_blocked:
@@ -1557,6 +1609,9 @@ try:
                 run_time += production_loop_delta
 
         else:
+            # Update previous GPIO levels without counting while outside NORMAL mode.
+            limit_switch_prev = GPIO.input(LIMIT_SWITCH_PIN)
+            sample_waterjet_inputs(accept_counts=False)
             # Non-normal modes
             if current_mode == MODE_DOWN:
                 current_status = STATUS_DOWN
@@ -1603,7 +1658,7 @@ try:
                 f"[MACHINE STATUS] {debug_status_names.get(current_status, 'UNKNOWN')} | "
                 f"Mode: {current_mode} | Waterjet Model: {total_output} | "
                 f"Waterjet Shift: {shift_total_output} (A={waterjet_a_output} B={waterjet_b_output}) | "
-                f"Forming Shift: {forming_output}"
+                f"Forming Shift: {forming_output} | MF: {mf_count} | WJ1: {wj1_count} | WJ2: {wj2_count}"
             )
             
         time.sleep(0.05)

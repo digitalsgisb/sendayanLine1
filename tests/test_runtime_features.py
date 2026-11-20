@@ -47,8 +47,8 @@ class RuntimeFeatureTests(unittest.TestCase):
     def test_line1_sensor_and_timer_rules_are_preserved(self):
         source = read_source()
         self.assertIn("LIMIT_SWITCH_COUNT_DEBOUNCE_TIME = 2.0", source)
-        self.assertIn("current_machine_state = get_stable_machine_state(prox_reading)", source)
-        self.assertIn("WATERJET_COUNT_DEBOUNCE_TIME = 2.0", source)
+        self.assertIn("current_machine_state = get_stable_machine_state(accept_counts=production_tracking_enabled)", source)
+        self.assertIn("WJ1_CONFIRM_LOW_SECONDS = 1.5", source)
         self.assertIn("if duration < 10:", source)
         self.assertIn("current_cycle_time = (batch_run_time / total_output) / 60.0", source)
 
@@ -124,6 +124,9 @@ class RuntimeFeatureTests(unittest.TestCase):
             "waterjet_a_output": 2,
             "waterjet_b_output": 1,
             "forming_output": 4,
+            "wj1_count": 1,
+            "wj2_count": 1,
+            "mf_count": 4,
             "LINE_CODE": "SDY1",
             "datetime": datetime,
             "enqueue_google_item": lambda item: actions.append("pdf" if item["action"] == "GENERATE_PDF" else "?"),

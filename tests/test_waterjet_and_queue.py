@@ -39,72 +39,130 @@ class TrackerTestCase(unittest.TestCase):
 
 
 class WaterjetCountingTests(TrackerTestCase):
-    def feed(self, a, b, t, enabled=True):
-        return self.g["update_waterjet_counts"](a, b, t, enabled)
+    """Site-tuned rules (Sendayan Line 1). GPIO reads 1 = HIGH, 0 = LOW."""
 
-    def test_block_unblock_block_is_one_cycle_and_first_block_is_ignored(self):
-        self.assertEqual(self.feed(False, False, 0), 0)
-        self.assertEqual(self.feed(True, False, 1), 0)   # first block after startup: arm only
-        self.assertEqual(self.feed(False, False, 2), 0)
-        self.assertEqual(self.feed(True, False, 3), 1)   # unblock -> block = one cycle
-        self.assertEqual(self.feed(True, False, 4), 0)   # still blocked, no double count
-        self.assertEqual(self.feed(False, False, 5), 0)
-        self.assertEqual(self.feed(True, False, 6), 1)
-        self.assertEqual((self.g["waterjet_a_output"], self.g["waterjet_b_output"]), (2, 0))
-        self.assertEqual((self.g["hourly_output"], self.g["total_output"], self.g["shift_total_output"]), (2, 2, 2))
+    def setUp(self):
+        super().setUp()
+        self.g["wj1_prev"] = self.g["wj2_prev"] = 1
+        self.g["last_wj1_count_time"] = self.g["last_wj2_count_time"] = -100.0
+        self.g["reset_wj1_cycle_qualification"]()
 
-    def test_sensor_already_blocked_at_startup_counts_from_the_next_block(self):
-        self.feed(False, True, 0)                         # B blocked at power-on: arm only
-        self.feed(False, False, 1)
-        self.assertEqual(self.feed(False, True, 2), 1)
-        self.assertEqual(self.g["waterjet_b_output"], 1)
+    def feed(self, p1, p2, t, accept=True):
+        self.g["apply_waterjet_sample"](p1, p2, t, accept)
 
-    def test_two_waterjets_count_independently_and_add_up(self):
-        self.feed(True, True, 0)
-        self.feed(False, False, 1)
-        self.assertEqual(self.feed(True, True, 2), 2)
-        self.assertEqual(self.g["shift_total_output"], 2)
-        self.assertEqual((self.g["waterjet_a_output"], self.g["waterjet_b_output"]), (1, 1))
+    def feed_wj1(self, level, start, end, step=0.05, accept=True):
+        t = start
+        while t <= end + 1e-9:
+            self.feed(level, 1, round(t, 3), accept)
+            t += step
 
-    def test_two_second_debounce_per_waterjet(self):
-        self.feed(True, False, 0)
-        self.feed(False, False, 1)
-        self.assertEqual(self.feed(True, False, 2), 1)
-        self.feed(False, False, 2.5)
-        self.assertEqual(self.feed(True, False, 3.0), 0)  # 1.0 s after the last count: chatter
-        self.assertEqual(self.g["waterjet_a_output"], 1)
+    def counts(self):
+        return (self.g["wj1_count"], self.g["wj2_count"], self.g["shift_total_output"])
 
-    def test_blocks_outside_normal_production_are_never_counted_later(self):
-        self.feed(True, False, 0)
-        self.feed(False, False, 1)
-        self.assertEqual(self.feed(True, False, 3, enabled=False), 0)   # e.g. during REST
-        self.assertEqual(self.feed(True, False, 6, enabled=True), 0)    # back to NORMAL, still blocked
-        self.assertEqual(self.g["shift_total_output"], 0)
+    def test_wj1_counts_after_2s_high_then_1_5s_low(self):
+        self.feed_wj1(1, 0.0, 2.0)                 # cutting: HIGH for 2 s arms the cycle
+        self.assertTrue(self.g["wj1_armed"])
+        self.feed_wj1(0, 2.05, 3.5)                # LOW for 1.45 s: not confirmed yet
+        self.assertEqual(self.counts(), (0, 0, 0))
+        self.feed_wj1(0, 3.55, 3.6)                # LOW reaches 1.5 s: one product
+        self.assertEqual(self.counts(), (1, 0, 1))
+        self.feed_wj1(0, 3.65, 10.0)               # staying LOW never counts again
+        self.assertEqual(self.counts(), (1, 0, 1))
+        self.assertEqual((self.g["waterjet_a_output"], self.g["hourly_output"], self.g["total_output"]), (1, 1, 1))
 
-    def test_shift_reset_clears_waterjet_and_forming_but_keeps_sensors_armed(self):
-        self.feed(True, False, 0)
-        self.g["forming_output"] = 7
+    def test_wj1_short_high_does_not_arm(self):
+        self.feed_wj1(1, 0.0, 1.9)
+        self.feed_wj1(0, 1.95, 6.0)
+        self.assertEqual(self.counts(), (0, 0, 0))
+
+    def test_wj1_starting_low_after_restart_needs_a_full_cycle(self):
+        self.feed_wj1(0, 0.0, 5.0)                 # LOW at startup: nothing inferred
+        self.assertEqual(self.counts(), (0, 0, 0))
+        self.feed_wj1(1, 5.05, 7.05)
+        self.feed_wj1(0, 7.1, 8.6)
+        self.assertEqual(self.counts(), (1, 0, 1))
+
+    def test_wj1_high_chatter_during_low_delays_but_keeps_the_cycle(self):
+        self.feed_wj1(1, 0.0, 2.0)
+        self.feed_wj1(0, 2.05, 3.0)
+        self.feed(1, 1, 3.05)                       # brief HIGH blip
+        self.feed_wj1(0, 3.1, 4.55)                 # LOW timer restarted at 3.1: 1.45 s
+        self.assertEqual(self.counts(), (0, 0, 0))
+        self.feed_wj1(0, 4.65, 4.65)                # past 1.5 s (exact float edges avoided)
+        self.assertEqual(self.counts(), (1, 0, 1))
+
+    def test_wj1_disarms_outside_normal_production(self):
+        self.feed_wj1(1, 0.0, 2.0)
+        self.feed(0, 1, 2.05, accept=False)         # e.g. REST
+        self.assertFalse(self.g["wj1_armed"])
+        self.feed_wj1(0, 2.1, 6.0)
+        self.assertEqual(self.counts(), (0, 0, 0))
+
+    def test_wj2_counts_each_high_to_low_edge_with_150ms_debounce(self):
+        self.feed(1, 0, 0.0)                        # HIGH -> LOW edge counts at once
+        self.assertEqual(self.counts(), (0, 1, 1))
+        self.feed(1, 1, 0.05)
+        self.feed(1, 0, 0.10)                       # 0.10 s later: bounce, ignored
+        self.assertEqual(self.counts(), (0, 1, 1))
+        self.feed(1, 1, 0.20)
+        self.feed(1, 0, 0.30)                       # 0.30 s after the last count: counts
+        self.assertEqual(self.counts(), (0, 2, 2))
+        self.assertEqual(self.g["waterjet_b_output"], 2)
+
+    def test_wj2_edges_outside_normal_production_are_never_counted_later(self):
+        self.feed(1, 0, 0.0, accept=False)
+        self.feed(1, 0, 1.0, accept=True)           # still LOW back in NORMAL: no edge
+        self.assertEqual(self.counts(), (0, 0, 0))
+
+    def test_both_waterjets_add_up_and_drive_cycle_time(self):
+        self.g["batch_run_time"] = 120.0
+        self.feed_wj1(1, 0.0, 2.0)
+        self.feed(0, 0, 2.05)                       # WJ2 edge
+        self.feed_wj1(0, 2.1, 3.6)
+        self.assertEqual(self.counts(), (1, 1, 2))
+        self.assertAlmostEqual(self.g["current_cycle_time"], 1.0)   # 120 s / 2 products / 60
+
+    def test_model_change_resets_model_counts_but_not_shift_panels(self):
+        self.g["receive_shift_form"](__import__("test_tablet_protocol").form(), datetime(2026, 11, 10, 10, 0))
+        self.feed(1, 0, 0.0)
+        self.g["mf_count"], self.g["forming_output"] = 3, 3
+        self.g["wj1_armed"] = True
+        self.g["push_hourly_to_sheets"](is_model_change=True)
+        self.assertEqual((self.g["wj1_count"], self.g["wj2_count"], self.g["mf_count"], self.g["total_output"]), (0, 0, 0, 0))
+        self.assertFalse(self.g["wj1_armed"])
+        self.assertEqual((self.g["waterjet_b_output"], self.g["forming_output"], self.g["shift_total_output"]), (1, 3, 1))
+
+    def test_shift_reset_clears_every_count(self):
+        self.feed(1, 0, 0.0)
+        self.g["forming_output"] = self.g["mf_count"] = 7
         self.g["reset_production_runtime_counters"]()
-        self.assertEqual((self.g["waterjet_a_output"], self.g["forming_output"]), (0, 0))
-        self.feed(False, False, 1)
-        self.assertEqual(self.feed(True, False, 3), 1)
+        self.assertEqual((self.g["wj2_count"], self.g["waterjet_b_output"], self.g["forming_output"], self.g["mf_count"]), (0, 0, 0, 0))
 
     def test_counters_survive_a_restart_snapshot(self):
-        self.g["waterjet_a_output"], self.g["waterjet_b_output"], self.g["forming_output"] = 3, 4, 5
+        for key, value in (("waterjet_a_output", 3), ("waterjet_b_output", 4), ("forming_output", 5),
+                           ("wj1_count", 1), ("wj2_count", 2), ("mf_count", 6)):
+            self.g[key] = value
         counters = self.g["build_runtime_snapshot"]()["counters"]
-        self.assertEqual((counters["waterjet_a_output"], counters["waterjet_b_output"], counters["forming_output"]), (3, 4, 5))
+        self.assertEqual([counters[k] for k in ("waterjet_a_output", "waterjet_b_output", "forming_output",
+                                                "wj1_count", "wj2_count", "mf_count")], [3, 4, 5, 1, 2, 6])
 
-    def test_live_payload_has_waterjet_and_forming_panels(self):
+    def test_live_payload_has_new_panels_and_site_fields(self):
         self.g["shift_total_output"], self.g["forming_output"] = 9, 4
+        self.g["wj1_count"], self.g["wj2_count"], self.g["mf_count"] = 2, 3, 4
         payload = self.g["publish_live_data"]()
         self.assertEqual((payload["waterjet_output"], payload["total_product_count"], payload["forming_output"]), (9, 9, 4))
+        self.assertEqual((payload["wj1_count"], payload["wj2_count"], payload["wj_total_count"], payload["mf_count"]), (2, 3, 5, 4))
+
+    def test_site_timing_values_are_kept(self):
+        self.assertEqual((self.g["WJ1_ARM_HIGH_SECONDS"], self.g["WJ1_CONFIRM_LOW_SECONDS"], self.g["WJ_COUNT_DEBOUNCE_TIME"]), (2.0, 1.5, 0.15))
 
     def test_forming_limit_switch_no_longer_changes_main_output(self):
         with open(os.path.join(SYSTEM_DIR, "sdy1.py"), encoding="utf-8") as source_file:
             source = source_file.read()
         forming_block = source[source.index("# --- FORMING COUNTING"):source.index("# --- STATE LOGIC")]
         self.assertIn("forming_output += 1", forming_block)
-        for main_counter in ("hourly_output", "total_output", "current_cycle_time"):
+        self.assertIn("mf_count += 1", forming_block)
+        for main_counter in ("hourly_output +=", "total_output +=", "current_cycle_time ="):
             self.assertNotIn(main_counter, forming_block)
 
 

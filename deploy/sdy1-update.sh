@@ -3,7 +3,11 @@
 # fast-forward, install, test, restart, and roll back if anything fails.
 #
 # Usage (as root, normally via sdy1-update@<user>.service):
-#   /usr/local/sbin/sdy1-update.sh <linux-user>
+#   /usr/local/sbin/sdy1-update.sh <linux-user> [--stash-local-edits]
+#
+# Local code edits on the Pi normally stop the update. With --stash-local-edits
+# they are saved with "git stash" (recoverable: git stash list / git stash show -p)
+# only once a safe moment is reached, and put back if the update rolls back.
 #
 # A "safe moment" is: no active shift, or the line is in REST / PLANNED STOP.
 # While the line is producing the script waits and checks again every minute.
@@ -12,8 +16,10 @@
 # rewrites the script while it is running.
 set -euo pipefail
 
-APP_USER="${1:?usage: sdy1-update.sh <linux-user>}"
-APP_DIR="/home/$APP_USER/sdy1"
+APP_USER="${1:?usage: sdy1-update.sh <linux-user> [--stash-local-edits]}"
+STASH_LOCAL_EDITS="no"
+if [ "${2:-}" = "--stash-local-edits" ]; then STASH_LOCAL_EDITS="yes"; fi
+APP_DIR="${SDY1_APP_DIR:-/home/$APP_USER/sdy1}"
 SERVICE="sdy1@$APP_USER.service"
 VENV_PY="$APP_DIR/.venv/bin/python"
 BRANCH="${SDY1_UPDATE_BRANCH:-main}"
@@ -87,6 +93,9 @@ restart_and_check() {
 rollback() {
   log "ROLLING BACK to $OLD_COMMIT: $1"
   as_app git -C "$APP_DIR" reset --hard "$OLD_COMMIT"
+  if [ "$STASHED" = "yes" ]; then
+    if as_app git -C "$APP_DIR" stash pop --quiet; then log "Restored the Pi's local edits."; else log "WARNING: could not restore the Pi's local edits; they are still in 'git stash list'."; fi
+  fi
   as_app "$VENV_PY" -m pip install --quiet -r "$APP_DIR/requirements.txt" || true
   if [ "$UNIT_CHANGED" = "yes" ]; then install_service_unit; fi
   if [ "$RESTARTED" = "yes" ]; then
@@ -99,8 +108,10 @@ log "=== Update check for $SERVICE (branch $BRANCH) ==="
 cd "$APP_DIR"
 UNIT_CHANGED="no"
 RESTARTED="no"
+STASHED="no"
 
-if [ -n "$(as_app git -C "$APP_DIR" status --porcelain --untracked-files=no)" ]; then
+LOCAL_EDITS="$(as_app git -C "$APP_DIR" status --porcelain --untracked-files=no)"
+if [ -n "$LOCAL_EDITS" ] && [ "$STASH_LOCAL_EDITS" != "yes" ]; then
   log "ABORT: the Pi has local code edits. Review them with 'git status' first. Nothing was changed."
   exit 1
 fi
@@ -120,7 +131,14 @@ log "Update available: $OLD_COMMIT -> $NEW_COMMIT"
 
 wait_for_safe_moment || exit 1
 
-as_app git -C "$APP_DIR" merge --ff-only --quiet "$NEW_COMMIT"
+if [ -n "$LOCAL_EDITS" ]; then
+  log "Saving the Pi's local edits with git stash:"
+  echo "$LOCAL_EDITS"
+  as_app git -C "$APP_DIR" stash push --quiet -m "sdy1-update: local edits before $NEW_COMMIT ($(date '+%F %T'))"
+  STASHED="yes"
+fi
+
+as_app git -C "$APP_DIR" merge --ff-only --quiet "$NEW_COMMIT" || rollback "fast-forward failed"
 as_app "$VENV_PY" -m pip install --quiet -r "$APP_DIR/requirements.txt" || rollback "pip install failed"
 
 log "Running tests..."
@@ -130,7 +148,7 @@ if ! (cd "$APP_DIR" && as_app "$VENV_PY" -m unittest discover -s tests -p 'test_
 fi
 log "Tests passed."
 
-if ! git -C "$APP_DIR" diff --quiet "$OLD_COMMIT" "$NEW_COMMIT" -- deploy/sdy1@.service; then
+if ! as_app git -C "$APP_DIR" diff --quiet "$OLD_COMMIT" "$NEW_COMMIT" -- deploy/sdy1@.service; then
   UNIT_CHANGED="yes"
   install_service_unit
   log "Installed the updated sdy1@.service."
