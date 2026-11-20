@@ -17,8 +17,39 @@ while adding the same production lifecycle safeguards used by the ABB trackers.
   was submitted again.
 - Retained MQTT status and live recovery metadata.
 
-The SDY1 two-proximity/limit-switch counting flow, two-second count debounce,
-10-second loading threshold, and cycle-time formula remain unchanged.
+## Counting
+
+- **Waterjet (main output):** prox sensor 1 (GPIO 5) is waterjet A and prox
+  sensor 2 (GPIO 27) is waterjet B. A cycle is block -> unblock -> block: the
+  first block after startup only arms the sensor, and every later
+  unblock -> block counts one product, at most once per 2 seconds per waterjet.
+  Waterjet A + B is the main output: `hourly_output`, `product_count`,
+  `total_product_count`, the Hourly_Data "actual" column, the PDF, and the
+  cycle time (`batch_run_time / total_output`) all use it. Tablet count
+  adjustments change this count.
+- **Forming:** the limit switch (GPIO 26) counts `forming_output` for the live
+  panel only (also in the MQTT payload and the `shift.ended` event). It is not
+  written to the Sheet or PDF.
+- Both count only in NORMAL mode (and during the 08:00 shift-entry buffer).
+- Machine status is unchanged: both prox sensors blocked = LOADING, then DELAY
+  after 10 seconds; otherwise RUN.
+
+The live payload adds `waterjet_output`, `waterjet_a_output`,
+`waterjet_b_output` and `forming_output`.
+
+## Google Sheets sending
+
+Sheets rows and shift PDFs are queued in SQLite (`google_queue`) and sent by a
+background thread, so a slow or offline Apps Script never pauses sensor
+counting, and unsent rows survive a restart. Items are sent in order with the
+same `request_id` on every retry.
+
+The Apps Script URL is set from Smart Checksheet: it publishes a retained
+`sdy1/config` message such as
+`{"google_web_app_url": "https://script.google.com/macros/s/.../exec"}`. The
+tracker saves it in SQLite, uses it immediately and answers on
+`sdy1/config_result`. An empty value returns to the built-in
+`DEFAULT_WEB_APP_URL`.
 
 ## Runtime files
 
@@ -58,22 +89,46 @@ sudo systemctl enable --now "sdy1@$USER.service"
 
 See `SQLITE_RECOVERY_GUIDE.md` for restart, buffer, and outbox behavior.
 
-## Pull future updates on the Raspberry Pi
+## Updating the Raspberry Pi
 
-Check for local edits before pulling. If `git status --short` prints unexpected
-files, stop and review them first. Do not discard Raspberry Pi changes or its
-runtime database.
+`deploy/sdy1-update.sh` does the whole update safely:
+
+1. Refuses to run if the Pi has local code edits.
+2. Fetches `origin/main`; stops if it is already up to date.
+3. Waits for a **safe moment**: no active shift, or mode REST / PLANNED STOP.
+   It checks every minute for up to 12 hours.
+4. Fast-forwards, runs `pip install`, then runs the tests.
+5. Restarts `sdy1@<user>.service` and checks it stays running for 20 seconds.
+6. If any step fails, it resets to the previous commit and restarts the old
+   version. Everything is logged to `/var/log/sdy1-update.log`.
+
+### One-time install (does NOT change the running tracker)
+
+Run on the Pi. `git fetch` + `git show` only download; the files in `~/sdy1`
+stay untouched until the update runs.
 
 ```bash
 cd "$HOME/sdy1"
-git status --short
-git pull --ff-only origin main
-.venv/bin/python -m pip install -r requirements.txt
-.venv/bin/python -m unittest discover -s tests -p 'test_*.py'
-sudo install -m 0644 deploy/sdy1@.service /etc/systemd/system/sdy1@.service
+git fetch origin main
+git show origin/main:deploy/sdy1-update.sh | sudo install -m 0755 /dev/stdin /usr/local/sbin/sdy1-update.sh
+git show 'origin/main:deploy/sdy1-update@.service' | sudo install -m 0644 /dev/stdin /etc/systemd/system/sdy1-update@.service
+git show 'origin/main:deploy/sdy1-update@.timer' | sudo install -m 0644 /dev/stdin /etc/systemd/system/sdy1-update@.timer
 sudo systemctl daemon-reload
-sudo systemctl restart "sdy1@$USER.service"
-sudo systemctl status "sdy1@$USER.service" --no-pager
+sudo systemctl enable --now "sdy1-update@$USER.timer"
+systemctl list-timers "sdy1-update@$USER.timer" --no-pager
+```
+
+Check the Pi's clock and time zone first (`timedatectl`): the timer uses local
+time. Do not run `git pull` on the Pi before the scheduled update.
+
+### Later updates
+
+Edit `OnCalendar=` in the timer for a new planned date, or start one now (it
+still waits for a safe moment):
+
+```bash
+sudo systemctl start --no-block "sdy1-update@$USER.service"
+tail -f /var/log/sdy1-update.log
 ```
 
 If the service does not start, inspect its latest logs:

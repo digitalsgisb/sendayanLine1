@@ -4,12 +4,14 @@ import time
 from datetime import datetime, timedelta
 import json
 import os
+import re
 import threading
 import uuid
 import paho.mqtt.client as mqtt
 import requests
 
 from sdy_downtime_session import empty_session, transition as downtime_transition
+from sdy_google_sender import GoogleSheetsSender, MemoryGoogleQueue
 from sdy_persistence import ProductionOutboxSender, ProductionSQLiteStore
 from sdy_shift_schedule import (
     calculate_shift_end_datetime,
@@ -32,6 +34,7 @@ GPIO.setup(LIMIT_SWITCH_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
 
 SENSOR_DEBOUNCE_TIME = 0.05
 LIMIT_SWITCH_COUNT_DEBOUNCE_TIME = 2.0
+WATERJET_COUNT_DEBOUNCE_TIME = 2.0
 
 # ==========================================
 # GLOBAL VARIABLES & COUNTERS
@@ -48,11 +51,15 @@ total_real_operating_time = 0.0
 # Tracks active time for the current batch (resets on model change & shift end)
 batch_run_time = 0.0 
 
-# Output Trackers
-total_output = 0            # Product count (resets on model change)
-shift_total_output = 0      # Total product count (resets on shift end only)
-hourly_output = 0 
+# Output Trackers. The MAIN output is the waterjet count (waterjet A + waterjet B):
+# it feeds the hourly Sheet row, the PDF, plan-vs-actual and the cycle time.
+total_output = 0            # Waterjet product count (resets on model change)
+shift_total_output = 0      # Waterjet product count (resets on shift end only)
+hourly_output = 0           # Waterjet product count this hour
 total_rejects = 0           # Sum of dashboard rejects received via MQTT
+waterjet_a_output = 0       # Shift total from prox sensor 1 (waterjet A)
+waterjet_b_output = 0       # Shift total from prox sensor 2 (waterjet B)
+forming_output = 0          # Shift total from the forming limit switch (live panel only)
 
 # Hourly Trackers
 hourly_rest_time = 0.0
@@ -65,6 +72,14 @@ blockage_start_time = 0.0
 current_cycle_time = 0.0
 limit_switch_prev = 1       # Assumes 1 (HIGH) is unpressed
 last_limit_switch_count_time = 0.0
+
+# Waterjet cycle detection, one entry per waterjet. A cycle is block -> unblock ->
+# block: the first block seen after startup only arms the sensor, and every later
+# unblock -> block transition counts one product.
+waterjet_sensors = {
+    "A": {"pin": PROX_SENSOR_1_PIN, "prev_blocked": None, "armed": False, "last_count_time": 0.0},
+    "B": {"pin": PROX_SENSOR_2_PIN, "prev_blocked": None, "armed": False, "last_count_time": 0.0},
+}
 
 # ==========================================
 # MQTT & GOOGLE SHEETS CONFIGURATION
@@ -91,12 +106,21 @@ MQTT_TOPIC_ADJUST_COUNT = "nodered/adjust_count"
 MQTT_TOPIC_LIVE_HOURLY = "smartchecksheet/hourly"
 MQTT_TOPIC_LIVE_SNAPSHOT = "smartchecksheet/live"
 
-# Google Sheets Web App URL
-WEB_APP_URL = "https://script.google.com/macros/s/AKfycbxGLj9Ap-mrzAGMyFT3SpV4-lt1kXJqIB-UiAJ1bUfrWujup4GK0CGjbJ6DBf4rx3H7-w/exec"
-GOOGLE_APPEND_TIMEOUT_SECONDS = 30
-GOOGLE_PDF_TIMEOUT_SECONDS = 120
-GOOGLE_RETRY_BASE_SECONDS = 5
-GOOGLE_RETRY_MAX_SECONDS = 300
+# Settings pushed by Smart Checksheet (Lines & machines page) as a retained message.
+MQTT_TOPIC_CONFIG = "sdy1/config"
+MQTT_TOPIC_CONFIG_RESULT = "sdy1/config_result"
+
+# Google Sheets Web App URL. This built-in value is only the fallback: a URL saved
+# from Smart Checksheet (stored in SQLite) takes priority, with no restart needed.
+DEFAULT_WEB_APP_URL = "https://script.google.com/macros/s/AKfycbxGLj9Ap-mrzAGMyFT3SpV4-lt1kXJqIB-UiAJ1bUfrWujup4GK0CGjbJ6DBf4rx3H7-w/exec"
+WEB_APP_URL_SETTING = "google_web_app_url"
+WEB_APP_URL_PREFIX = "https://script.google.com/macros/s/"
+# Same shape as Smart Checksheet's shared/sheetsUrl.js (Workspace /a/macros/<domain>/s/ links too).
+WEB_APP_URL_PATTERN = re.compile(
+    r"^https://script\.google\.com/(?:a/macros/[A-Za-z0-9.-]{1,100}|macros)/s/[A-Za-z0-9_-]{10,200}/exec$"
+)
+OUTBOX_RETENTION_DAYS = 7
+OUTBOX_PRUNE_INTERVAL_SECONDS = 3600
 
 SCRIPT_DIRECTORY = os.path.dirname(os.path.abspath(__file__))
 SQLITE_DATABASE_PATH = os.environ.get(
@@ -151,8 +175,6 @@ current_shift = {
     "forming": "-", "waterjet": "-", "assembly": "-", "quality": "-"
 }
 
-google_sheets_queue = [] 
-
 persistence_store = None
 outbox_sender = None
 try:
@@ -166,6 +188,34 @@ try:
     )
 except Exception as exc:
     print(f"[SQLITE CRITICAL] Persistence disabled; production continues: {exc}")
+
+# Queued Sheets rows live in SQLite so they survive a restart; memory only if SQLite failed.
+google_queue = persistence_store if persistence_store is not None else MemoryGoogleQueue()
+google_sender = None
+last_outbox_prune = 0.0
+
+
+def is_valid_web_app_url(url):
+    return bool(WEB_APP_URL_PATTERN.match(str(url or "").strip()))
+
+
+def load_web_app_url():
+    if persistence_store is not None:
+        try:
+            saved = persistence_store.get_setting(WEB_APP_URL_SETTING)
+            if is_valid_web_app_url(saved):
+                return saved, "smartchecksheet"
+        except Exception as exc:
+            print(f"[CONFIG ERROR] Could not read the saved Google Sheets URL: {exc}")
+    return DEFAULT_WEB_APP_URL, "default"
+
+
+google_web_app_url, google_web_app_url_source = load_web_app_url()
+
+
+def current_web_app_url():
+    return google_web_app_url
+
 
 def safe_int(val):
     try: return int(val)
@@ -187,11 +237,21 @@ def build_google_request_id(scope, identity=None):
         )
     )
 
+def enqueue_google_item(item):
+    try:
+        google_queue.enqueue_google(item)
+    except Exception as exc:
+        print(f"[GOOGLE QUEUE ERROR] Could not queue {item.get('tab') or item.get('action')}: {exc}")
+        return
+    if google_sender is not None:
+        google_sender.wake()
+
+
 def queue_google_sheet_row(tab_name, row_data, event_id=None):
     request_identity = event_id
     if request_identity is None and tab_name == "Hourly_Data":
         request_identity = row_data
-    google_sheets_queue.append({
+    enqueue_google_item({
         "tab": tab_name,
         "row": row_data,
         "request_id": build_google_request_id(tab_name, request_identity),
@@ -245,6 +305,9 @@ def build_runtime_snapshot():
             "shift_total_output": shift_total_output,
             "hourly_output": hourly_output,
             "total_rejects": total_rejects,
+            "waterjet_a_output": waterjet_a_output,
+            "waterjet_b_output": waterjet_b_output,
+            "forming_output": forming_output,
         },
         "cycle": {"current_cycle_time": current_cycle_time},
         "timers": {
@@ -320,6 +383,7 @@ def restore_runtime_state():
     global total_rest_time, planned_stop_time, model_change_time, total_machine_time
     global real_operating_time, total_real_operating_time, batch_run_time
     global total_output, shift_total_output, hourly_output, total_rejects
+    global waterjet_a_output, waterjet_b_output, forming_output
     global hourly_rest_time, lost_time_this_hour, base_time_this_hour
     global current_cycle_time, current_mode, current_status, last_sent_hour
     global current_shift, sensor_blocked, recovered_from_sqlite
@@ -347,6 +411,9 @@ def restore_runtime_state():
     shift_total_output = int(counters.get("shift_total_output", 0))
     hourly_output = int(counters.get("hourly_output", 0))
     total_rejects = int(counters.get("total_rejects", 0))
+    waterjet_a_output = int(counters.get("waterjet_a_output", 0))
+    waterjet_b_output = int(counters.get("waterjet_b_output", 0))
+    forming_output = int(counters.get("forming_output", 0))
     current_cycle_time = float(snapshot.get("cycle", {}).get("current_cycle_time", 0.0))
     run_time = float(timers.get("run_time", 0.0))
     loading_time = float(timers.get("loading_time", 0.0))
@@ -380,37 +447,80 @@ def restore_runtime_state():
     )
     return True
 
-def get_stable_machine_state():
+def read_stable_prox_sensors():
     """
-    Checks Prox Sensor 1 and Prox Sensor 2. 
-    If BOTH are blocked, the machine is considered blocked.
+    Samples Prox Sensor 1 and Prox Sensor 2 five times (majority vote).
+    Returns (waterjet_a_blocked, waterjet_b_blocked, both_blocked).
+    Pins read 1 when clear and 0 when a product is present.
     """
     stable_readings = 5
-    blocked_count = unblocked_count = 0
+    a_blocked = b_blocked = both_blocked = 0
     for _ in range(stable_readings):
         p1 = GPIO.input(PROX_SENSOR_1_PIN)
         p2 = GPIO.input(PROX_SENSOR_2_PIN)
-        
-        # Assuming pin reads 1 when clear, 0 when product is present
-        # Now it strictly checks if BOTH sensors read 0
-        if p1 == 0 and p2 == 0: 
-            blocked_count += 1
-        else: 
-            unblocked_count += 1
-            
+        a_blocked += p1 == 0
+        b_blocked += p2 == 0
+        both_blocked += p1 == 0 and p2 == 0
         time.sleep(SENSOR_DEBOUNCE_TIME)
-        
-    return 1 if blocked_count > unblocked_count else 0
+    majority = stable_readings // 2 + 1
+    return a_blocked >= majority, b_blocked >= majority, both_blocked >= majority
+
+
+def get_stable_machine_state(prox_reading=None):
+    """
+    Checks Prox Sensor 1 and Prox Sensor 2.
+    If BOTH are blocked, the machine is considered blocked.
+    """
+    prox_reading = prox_reading or read_stable_prox_sensors()
+    return 1 if prox_reading[2] else 0
+
+
+def update_waterjet_counts(a_blocked, b_blocked, current_time, counting_enabled):
+    """Apply one stable reading to both waterjets; returns how many products were counted.
+
+    The first block after startup only arms a waterjet. After that every
+    unblock -> block transition is one finished cycle, at most one per
+    WATERJET_COUNT_DEBOUNCE_TIME. Transitions outside NORMAL production are
+    tracked (so they are not counted later) but never counted.
+    """
+    global hourly_output, total_output, shift_total_output, waterjet_a_output, waterjet_b_output
+    counted = 0
+    for name, blocked in (("A", a_blocked), ("B", b_blocked)):
+        sensor = waterjet_sensors[name]
+        new_block = blocked and sensor["prev_blocked"] is False
+        first_block = blocked and not sensor["armed"]
+        sensor["prev_blocked"] = blocked
+        if first_block:
+            sensor["armed"] = True
+            print(f"[SENSOR] Waterjet {name} armed (first block after startup is not counted).")
+            continue
+        if (new_block and counting_enabled and
+                current_time - sensor["last_count_time"] >= WATERJET_COUNT_DEBOUNCE_TIME):
+            sensor["last_count_time"] = current_time
+            hourly_output += 1
+            total_output += 1
+            shift_total_output += 1
+            if name == "A":
+                waterjet_a_output += 1
+            else:
+                waterjet_b_output += 1
+            counted += 1
+            print(f"\n[SENSOR] Waterjet {name} cycle counted! Total (Model): {total_output} | "
+                  f"Total (Shift): {shift_total_output} | A={waterjet_a_output} B={waterjet_b_output}")
+    return counted
+
 
 def reset_production_runtime_counters():
     global run_time, loading_time, delay_time, downtime, total_rest_time, planned_stop_time, model_change_time
     global total_machine_time, total_output, hourly_output, hourly_rest_time, lost_time_this_hour, base_time_this_hour, sensor_blocked
     global shift_total_output, total_rejects, current_cycle_time, real_operating_time, limit_switch_prev
     global total_real_operating_time, batch_run_time, last_sent_hour
+    global waterjet_a_output, waterjet_b_output, forming_output
 
     run_time = loading_time = delay_time = downtime = 0.0
     total_rest_time = planned_stop_time = model_change_time = total_machine_time = 0.0
     total_output = hourly_output = shift_total_output = total_rejects = 0
+    waterjet_a_output = waterjet_b_output = forming_output = 0
     hourly_rest_time = lost_time_this_hour = base_time_this_hour = 0.0
     real_operating_time = total_real_operating_time = current_cycle_time = batch_run_time = 0.0
     sensor_blocked = False
@@ -590,6 +700,10 @@ def execute_end_shift(hour_slot_override=None, end_reason="MANUAL SHIFT END"):
         "scheduled_end_at": current_shift.get("scheduled_end_at"),
         "shift_total_output": shift_total_output,
         "model_total_output": total_output,
+        "waterjet_output": shift_total_output,
+        "waterjet_a_output": waterjet_a_output,
+        "waterjet_b_output": waterjet_b_output,
+        "forming_output": forming_output,
         "total_rejects": total_rejects,
         "end_reason": end_reason,
         "ended_at": datetime.now().astimezone().isoformat(),
@@ -598,7 +712,7 @@ def execute_end_shift(hour_slot_override=None, end_reason="MANUAL SHIFT END"):
     checkpoint_and_queue_event(
         "shift.ended", ending_event, shift_id=ending_shift_id
     )
-    google_sheets_queue.append({
+    enqueue_google_item({
         "action": "GENERATE_PDF",
         "shift_id": ending_shift_id,
         "request_id": build_google_request_id("GENERATE_PDF", ending_shift_id),
@@ -940,7 +1054,7 @@ def on_connect(client, userdata, flags, rc):
                       (MQTT_TOPIC_NR_REJECT, 0), (MQTT_TOPIC_NR_DOWNTIME, 0),
                       (MQTT_TOPIC_NR_ENDSHIFT, 0), (MQTT_TOPIC_MODE, 0),
                       (MQTT_TOPIC_PARAM_CONDITION, 0), (MQTT_TOPIC_ADJUST_COUNT, 0),
-                      (MQTT_TOPIC_DOWNTIME_SESSION, 1)])
+                      (MQTT_TOPIC_DOWNTIME_SESSION, 1), (MQTT_TOPIC_CONFIG, 1)])
     client.publish(
         MQTT_TOPIC_STATUS,
         json.dumps({
@@ -953,6 +1067,37 @@ def on_connect(client, userdata, flags, rc):
         retain=True,
     )
     print(f"\n[SYSTEM] Connected to MQTT Broker. Ready to receive commands.")
+
+def apply_line_config(data):
+    """Apply settings from Smart Checksheet. An empty URL returns to the built-in fallback."""
+    global google_web_app_url, google_web_app_url_source
+    result = {"line_code": LINE_CODE, "status": "applied", "message": "",
+              "request_id": data.get("request_id") if isinstance(data, dict) else None}
+    if not isinstance(data, dict) or WEB_APP_URL_SETTING not in data:
+        result.update(status="rejected", message=f"Send JSON with {WEB_APP_URL_SETTING}.")
+    else:
+        url = str(data.get(WEB_APP_URL_SETTING) or "").strip()
+        if url and not is_valid_web_app_url(url):
+            result.update(status="rejected",
+                          message=f"Use an Apps Script web app link: {WEB_APP_URL_PREFIX}.../exec")
+        else:
+            try:
+                if persistence_store is not None:
+                    persistence_store.set_setting(WEB_APP_URL_SETTING, url or None)
+                google_web_app_url = url or DEFAULT_WEB_APP_URL
+                google_web_app_url_source = "smartchecksheet" if url else "default"
+                print(f"[CONFIG] Google Sheets URL now from {google_web_app_url_source}.")
+                if google_sender is not None:
+                    google_sender.wake()
+            except Exception as exc:
+                result.update(status="rejected", message=f"Could not save the setting: {exc}")
+    result.update(google_web_app_url=google_web_app_url, google_web_app_url_source=google_web_app_url_source)
+    try:
+        mqtt_client.publish(MQTT_TOPIC_CONFIG_RESULT, json.dumps(result), qos=1, retain=True)
+    except Exception as exc:
+        print(f"[CONFIG ACK ERROR] {exc}")
+    return result
+
 
 def on_message(client, userdata, msg):
     # Added total_output, shift_total_output, hourly_output, current_cycle_time, batch_run_time to global vars
@@ -968,7 +1113,10 @@ def on_message(client, userdata, msg):
             print("[TEST] Command ignored; production state is unchanged.")
             return
 
-        if topic == MQTT_TOPIC_DOWNTIME_SESSION and is_json:
+        if topic == MQTT_TOPIC_CONFIG:
+            apply_line_config(data if is_json else None)
+
+        elif topic == MQTT_TOPIC_DOWNTIME_SESSION and is_json:
             process_downtime_command(data)
 
         elif topic == MQTT_TOPIC_SHIFT_FORM and is_json:
@@ -1189,58 +1337,37 @@ if outbox_sender is not None:
 # ==========================================
 # MAIN EXECUTION LOOP
 # ==========================================
-def process_gsheets_queue():
-    if len(google_sheets_queue) > 0:
-        if time.time() < google_sheets_queue[0].get("next_retry_at", 0):
-            return
-        item = google_sheets_queue.pop(0)
-        request_id = item.setdefault("request_id", str(uuid.uuid4()))
-        if item.get("action") == "GENERATE_PDF":
-            payload = {
-                "action": "GENERATE_PDF",
-                "shift_id": item["shift_id"],
-                "request_id": request_id,
-            }
-            description = f"PDF generation for {item['shift_id']}"
-            request_timeout = GOOGLE_PDF_TIMEOUT_SECONDS
-        else:
-            payload = {
-                "action": "APPEND_ROW",
-                "tab_name": item["tab"],
-                "row_data": item["row"],
-                "request_id": request_id,
-            }
-            description = f"{item['tab']} data"
-            request_timeout = GOOGLE_APPEND_TIMEOUT_SECONDS
+google_sender = GoogleSheetsSender(google_queue, current_web_app_url, requests.post)
+google_sender.start()
+
+_google_queue_length_cache = (0.0, 0)
+
+
+def google_queue_length():
+    """Queued Sheets requests, refreshed at most every 5 seconds for the live payload."""
+    global _google_queue_length_cache
+    checked_at, length = _google_queue_length_cache
+    if time.time() - checked_at >= 5.0:
         try:
-            response = requests.post(
-                WEB_APP_URL,
-                json=payload,
-                timeout=request_timeout,
-            )
-            response.raise_for_status()
-            try:
-                response_body = response.json()
-            except ValueError as exc:
-                raise RuntimeError(
-                    f"Apps Script returned non-JSON response: {response.text[:200]}"
-                ) from exc
-            if response_body.get("status") != "success":
-                raise RuntimeError(f"Apps Script rejected the request: {response_body}")
-            print(f"[HTTP] SUCCESS! Completed Google action: {description}.")
-        except Exception as e:
-            attempt_count = item.get("attempt_count", 0) + 1
-            retry_delay = min(
-                GOOGLE_RETRY_BASE_SECONDS * (2 ** min(attempt_count - 1, 6)),
-                GOOGLE_RETRY_MAX_SECONDS,
-            )
-            item["attempt_count"] = attempt_count
-            item["next_retry_at"] = time.time() + retry_delay
-            print(
-                f"[HTTP ERROR] Failed to send {description}; retrying in "
-                f"{retry_delay}s with request {request_id}: {e}"
-            )
-            google_sheets_queue.insert(0, item)
+            length = google_queue.google_queue_count()
+        except Exception:
+            pass
+        _google_queue_length_cache = (time.time(), length)
+    return length
+
+
+def prune_outbox_if_due():
+    """Hourly: delete outbox events older than 7 days that every consumer has delivered."""
+    global last_outbox_prune
+    if persistence_store is None or time.time() - last_outbox_prune < OUTBOX_PRUNE_INTERVAL_SECONDS:
+        return
+    last_outbox_prune = time.time()
+    try:
+        deleted = persistence_store.prune_finished_events(TRUSTED_API_ENABLED, OUTBOX_RETENTION_DAYS)
+        if deleted:
+            print(f"[SQLITE] Removed {deleted} delivered outbox event(s) older than {OUTBOX_RETENTION_DAYS} days.")
+    except Exception as exc:
+        print(f"[SQLITE ERROR] Outbox cleanup failed: {exc}")
 
 def publish_live_data():
     global last_live_snapshot_publish
@@ -1280,9 +1407,15 @@ def publish_live_data():
         "hourly_plan": current_shift.get("target", 0),
         "machine_status": current_status,
         "current_mode": current_mode,
-        "product_count": total_output, 
+        "product_count": total_output,
         "total_product_count": shift_total_output,
         "hourly_output": hourly_output,
+        "waterjet_output": shift_total_output,
+        "waterjet_a_output": waterjet_a_output,
+        "waterjet_b_output": waterjet_b_output,
+        "forming_output": forming_output,
+        "google_sheets_url_source": google_web_app_url_source,
+        "google_queue_length": google_queue_length(),
         "live_plan": live_plan,
         "full_hour_plan": full_hour_plan,
         "hour_base_minutes": round(live_base_minutes, 2),
@@ -1357,8 +1490,8 @@ try:
             push_hourly_to_sheets(is_model_change=False)
             last_sent_hour = now.hour
 
-        # 2. Process Data Queue
-        process_gsheets_queue()
+        # 2. Google Sheets rows are sent by the background sender thread.
+        prune_outbox_if_due()
 
         # 3. Timer Accumulation (same Sendayan formulas, lifecycle-gated)
         active_shift = current_shift.get("shift_id") != "NO PROD"
@@ -1375,28 +1508,33 @@ try:
         # 4. Main State & Counting Logic
         if current_mode == MODE_NORMAL:
             batch_run_time += production_loop_delta
-            
-            # --- COUNTING LOGIC (Sensor 3 / Limit Switch) ---
+
+        # --- MAIN OUTPUT: WATERJET COUNTING (Prox Sensors 1 & 2) ---
+        # Read in every mode so a block during REST/DOWN is never counted later.
+        prox_reading = read_stable_prox_sensors()
+        if update_waterjet_counts(prox_reading[0], prox_reading[1], current_time,
+                                  current_mode == MODE_NORMAL and production_tracking_enabled):
+            # Cycle time follows the waterjet output.
+            if total_output > 0:
+                current_cycle_time = (batch_run_time / total_output) / 60.0
+            checkpoint_runtime_state(force=True, reason="waterjet product detection")
+
+        if current_mode == MODE_NORMAL:
+            # --- FORMING COUNTING (Sensor 3 / Limit Switch): live panel only ---
             limit_switch_current = GPIO.input(LIMIT_SWITCH_PIN)
             # Detects transition from UNBLOCKED (1) to BLOCKED (0)
             if (limit_switch_current == 0 and limit_switch_prev == 1 and
                     current_time - last_limit_switch_count_time >= LIMIT_SWITCH_COUNT_DEBOUNCE_TIME and
                     production_tracking_enabled):
-                hourly_output += 1
-                total_output += 1
-                shift_total_output += 1
+                forming_output += 1
                 last_limit_switch_count_time = current_time
-                checkpoint_runtime_state(force=True, reason="product detection")
-                
-                if total_output > 0:
-                    current_cycle_time = (batch_run_time / total_output) / 60.0
-                
-                print(f"\n[SENSOR] Output Counted via Limit Switch! Total (Model): {total_output} | Total (Shift): {shift_total_output}")
-            
+                checkpoint_runtime_state(force=True, reason="forming product detection")
+                print(f"\n[SENSOR] Forming Counted via Limit Switch! Forming (Shift): {forming_output}")
+
             limit_switch_prev = limit_switch_current
 
-            # --- STATE LOGIC (Prox Sensors 1 & 2) ---
-            current_machine_state = get_stable_machine_state()
+            # --- STATE LOGIC (Prox Sensors 1 & 2, unchanged: both blocked = loading/delay) ---
+            current_machine_state = get_stable_machine_state(prox_reading)
 
             if current_machine_state == 1: # BLOCKED (Either prox sensor blocked)
                 if not sensor_blocked:
@@ -1463,8 +1601,9 @@ try:
             }
             print(
                 f"[MACHINE STATUS] {debug_status_names.get(current_status, 'UNKNOWN')} | "
-                f"Mode: {current_mode} | Model Count: {total_output} | "
-                f"Shift Count: {shift_total_output}"
+                f"Mode: {current_mode} | Waterjet Model: {total_output} | "
+                f"Waterjet Shift: {shift_total_output} (A={waterjet_a_output} B={waterjet_b_output}) | "
+                f"Forming Shift: {forming_output}"
             )
             
         time.sleep(0.05)
@@ -1490,6 +1629,10 @@ finally:
         outbox_sender.stop()
         if outbox_sender.is_alive():
             outbox_sender.join(timeout=6.0)
+    if google_sender is not None:
+        google_sender.stop()
+        # A request in flight may take up to 120 s; it stays queued and is resent after restart.
+        google_sender.join(timeout=2.0)
     GPIO.cleanup()
     mqtt_client.disconnect()
     mqtt_client.loop_stop()
